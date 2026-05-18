@@ -4626,7 +4626,9 @@ int ds4_gpu_init_expert_streaming(uint64_t expert_stride) {
         g_expert_dma_ptrs[i] = ptr;
         g_expert_dma[i] = [g_device newBufferWithBytesNoCopy:ptr
                                                       length:(NSUInteger)alloc_size
-                                                     options:MTLResourceStorageModeShared
+                                                     options:MTLResourceStorageModeShared |
+                                                             MTLResourceCPUCacheModeWriteCombined |
+                                                             MTLResourceHazardTrackingModeUntracked
                                                  deallocator:nil];
         if (!g_expert_dma[i]) {
             fprintf(stderr, "ds4: failed to create Metal DMA buffer for expert slot %d\n", i);

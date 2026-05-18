@@ -1209,6 +1209,7 @@ typedef struct {
     bool plain;
     bool warm_weights;
     bool quality;
+    bool expert_stream;
 } eval_config;
 
 typedef struct {
@@ -1575,6 +1576,8 @@ static eval_config parse_options(int argc, char **argv) {
             c.quality = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.warm_weights = true;
+        } else if (!strcmp(arg, "--expert-stream")) {
+            c.expert_stream = true;
         } else if (!strcmp(arg, "--think")) {
             c.think_mode = DS4_THINK_HIGH;
         } else if (!strcmp(arg, "--nothink")) {
@@ -3242,6 +3245,7 @@ int main(int argc, char **argv) {
         .mtp_margin = 3.0f,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
+        .expert_stream = cfg.expert_stream,
     };
 
     ds4_engine *engine = NULL;

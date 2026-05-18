@@ -36,6 +36,7 @@ typedef struct {
     double step_mul;
     bool warm_weights;
     bool quality;
+    bool expert_stream;
 } bench_config;
 
 static double bench_now_sec(void) {
@@ -221,6 +222,8 @@ static bench_config parse_options(int argc, char **argv) {
             c.quality = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.warm_weights = true;
+        } else if (!strcmp(arg, "--expert-stream")) {
+            c.expert_stream = true;
         } else {
             fprintf(stderr, "ds4-bench: unknown option: %s\n", arg);
             usage(stderr);
@@ -293,6 +296,7 @@ int main(int argc, char **argv) {
         .n_threads = cfg.threads,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
+        .expert_stream = cfg.expert_stream,
     };
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opt) != 0) return 1;

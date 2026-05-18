@@ -128,6 +128,8 @@ typedef struct {
     uint32_t gate_type;
     uint32_t down_type;
     void *io_pool;
+    int32_t prev_selected[43][6];  /* previous token's experts per layer */
+    bool prev_valid;               /* true after first token completes */
 } ds4_expert_stream_ctx;
 
 static ds4_expert_stream_ctx g_stream_ctx;
@@ -9308,6 +9310,31 @@ static bool metal_graph_encode_decode_layer(
     const bool qkv_rms_fused = !metal_graph_use_reference_qkv_norm();
 
     bool ok = true;
+
+    /* Speculative prefetch: at layer start, advise the kernel to begin reading
+     * experts this layer used on the previous token.  The entire attention +
+     * norm compute (~3-5ms) runs before we need the pread results, giving the
+     * kernel enough lead time to pull pages from SSD into the page cache. */
+    if (g_stream_ctx.active && g_stream_ctx.gguf_direct && g_stream_ctx.prev_valid) {
+        for (int pk = 0; pk < DS4_N_EXPERT_USED; pk++) {
+            int32_t pe = g_stream_ctx.prev_selected[il][pk];
+            if (pe < 0 || pe >= DS4_N_EXPERT) continue;
+            struct radvisory ra;
+            ra.ra_offset = (off_t)(g_stream_ctx.gate_abs[il] +
+                (uint64_t)pe * g_stream_ctx.gate_expert_bytes);
+            ra.ra_count  = (int)g_stream_ctx.gate_expert_bytes;
+            fcntl(g_stream_ctx.model_fd, F_RDADVISE, &ra);
+            ra.ra_offset = (off_t)(g_stream_ctx.up_abs[il] +
+                (uint64_t)pe * g_stream_ctx.up_expert_bytes);
+            ra.ra_count  = (int)g_stream_ctx.up_expert_bytes;
+            fcntl(g_stream_ctx.model_fd, F_RDADVISE, &ra);
+            ra.ra_offset = (off_t)(g_stream_ctx.down_abs[il] +
+                (uint64_t)pe * g_stream_ctx.down_expert_bytes);
+            ra.ra_count  = (int)g_stream_ctx.down_expert_bytes;
+            fcntl(g_stream_ctx.model_fd, F_RDADVISE, &ra);
+        }
+    }
+
     const bool decode_stage_profile = getenv("DS4_METAL_DECODE_STAGE_PROFILE") != NULL;
     double decode_stage_t0 = decode_stage_profile ? now_sec() : 0.0;
 #define DS4_METAL_PROFILE_DECODE_STAGE(name) do { \
@@ -9915,8 +9942,6 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, DS4_N_EXPERT_USED, il, pos);
     }
     if (ok && g_stream_ctx.active) {
-        /* Expert streaming: flush GPU for router results, pread experts
-         * from GGUF into DMA buffers, then dispatch MoE with streamed data. */
         ok = ds4_gpu_end_commands() != 0;
         if (ok) {
             int32_t selected_ids[DS4_N_EXPERT_USED];
@@ -9929,6 +9954,10 @@ static bool metal_graph_encode_decode_layer(
                                           selected_ids, DS4_N_EXPERT_USED);
                 ds4_io_pool_dispatch(
                     (ds4_io_pool *)g_stream_ctx.io_pool, tasks, n_tasks);
+                memcpy(g_stream_ctx.prev_selected[il], selected_ids,
+                       sizeof(int32_t) * DS4_N_EXPERT_USED);
+                if (il == DS4_N_LAYER - 1)
+                    g_stream_ctx.prev_valid = true;
             }
         }
         if (ok) ok = ds4_gpu_begin_commands() != 0;
