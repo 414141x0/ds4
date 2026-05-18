@@ -11,5 +11,7 @@
 *.o
 *.dSYM/
 /misc/
+/packed_experts/
+/STREAMING_LOG.md
 .*.swp
 .DS_Store
