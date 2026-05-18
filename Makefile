@@ -15,8 +15,8 @@ METAL_SRCS := $(wildcard metal/*.metal)
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
-CORE_OBJS = ds4.o ds4_metal.o
-CPU_CORE_OBJS = ds4_cpu.o
+CORE_OBJS = ds4.o ds4_metal.o ds4_expert_io.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_expert_io.o
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda
@@ -35,7 +35,7 @@ endif
 .PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression
 
 ifeq ($(UNAME_S),Darwin)
-all: ds4 ds4-server ds4-bench ds4-eval
+all: ds4 ds4-server ds4-bench ds4-eval repack-experts
 
 help:
 	@echo "DS4 build targets:"
@@ -112,7 +112,7 @@ cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke
 endif
 
-ds4.o: ds4.c ds4.h ds4_gpu.h
+ds4.o: ds4.c ds4.h ds4_gpu.h ds4_expert_io.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
 ds4_cli.o: ds4_cli.c ds4.h linenoise.h
@@ -154,8 +154,14 @@ ds4_bench_cpu.o: ds4_bench.c ds4.h
 ds4_eval_cpu.o: ds4_eval.c ds4.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_eval.c
 
+ds4_expert_io.o: ds4_expert_io.c ds4_expert_io.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_expert_io.c
+
 ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
+
+repack-experts: gguf-tools/repack_experts.c
+	$(CC) $(CFLAGS) -o $@ gguf-tools/repack_experts.c
 
 ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu

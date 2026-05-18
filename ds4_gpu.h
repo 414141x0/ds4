@@ -677,6 +677,52 @@ int ds4_gpu_routed_moe_batch_tensor(
         bool                   *mid_is_f16);
 
 /* =========================================================================
+ * Expert Streaming DMA Buffers.
+ * =========================================================================
+ *
+ * Pre-allocated 2MB-aligned Metal shared buffers for SSD-to-GPU expert
+ * streaming.  pread() fills these from packed expert files, then the
+ * streamed MoE dispatch reads them directly on the GPU.
+ */
+
+typedef struct {
+    uint64_t offset;
+    uint64_t size;
+} ds4_model_span;
+
+int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size,
+                                const ds4_model_span *spans, int n_spans);
+
+void ds4_gpu_set_skip_model_residency(int skip);
+int ds4_gpu_init_expert_streaming(uint64_t expert_stride);
+void *ds4_gpu_expert_dma_ptr(int slot);
+int ds4_gpu_expert_dma_slot_count(void);
+
+int ds4_gpu_routed_moe_one_streamed(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *experts,
+        uint64_t                gate_bytes,
+        uint64_t                up_bytes,
+        uint64_t                expert_stride,
+        uint32_t                gate_type,
+        uint32_t                down_type,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_expert,
+        float                   clamp,
+        const ds4_gpu_tensor *x);
+
+/* =========================================================================
  * Hyper-Connection Kernels.
  * =========================================================================
  *

@@ -1310,6 +1310,10 @@ static cli_config parse_options(int argc, char **argv) {
             c.inspect = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
+        } else if (!strcmp(arg, "--expert-pack-dir")) {
+            c.engine.expert_pack_dir = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--expert-stream")) {
+            c.engine.expert_stream = true;
         } else if (!strcmp(arg, "--server")) {
             fprintf(stderr, "ds4: use ds4-server for the HTTP server\n");
             exit(2);
