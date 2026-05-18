@@ -13301,6 +13301,47 @@ static id<MTLBuffer> g_stream_selected_remap;
 static uint64_t g_stream_gate_cap;
 static uint64_t g_stream_down_cap;
 
+int ds4_gpu_prepare_stream_staging(uint32_t n_expert,
+                                    uint64_t gate_expert_bytes,
+                                    uint64_t down_expert_bytes,
+                                    void **gate_ptr, void **up_ptr, void **down_ptr,
+                                    int32_t **remap_ptr) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (n_expert == 0 || n_expert > DS4_EXPERT_DMA_SLOTS) return 0;
+
+    const MTLResourceOptions wc_opts = MTLResourceStorageModeShared |
+                                        MTLResourceCPUCacheModeWriteCombined |
+                                        MTLResourceHazardTrackingModeUntracked;
+    const uint64_t need_gate = (uint64_t)n_expert * gate_expert_bytes;
+    const uint64_t need_down = (uint64_t)n_expert * down_expert_bytes;
+
+    if (!g_stream_gate_combined || g_stream_gate_cap < need_gate) {
+        g_stream_gate_combined = [g_device newBufferWithLength:(NSUInteger)need_gate
+                                                      options:wc_opts];
+        g_stream_up_combined = [g_device newBufferWithLength:(NSUInteger)need_gate
+                                                    options:wc_opts];
+        g_stream_gate_cap = need_gate;
+        if (!g_stream_gate_combined || !g_stream_up_combined) return 0;
+    }
+    if (!g_stream_down_combined || g_stream_down_cap < need_down) {
+        g_stream_down_combined = [g_device newBufferWithLength:(NSUInteger)need_down
+                                                      options:wc_opts];
+        g_stream_down_cap = need_down;
+        if (!g_stream_down_combined) return 0;
+    }
+    if (!g_stream_selected_remap) {
+        g_stream_selected_remap = [g_device newBufferWithLength:DS4_EXPERT_DMA_SLOTS * sizeof(int32_t)
+                                                       options:MTLResourceStorageModeShared];
+        if (!g_stream_selected_remap) return 0;
+    }
+
+    *gate_ptr = [g_stream_gate_combined contents];
+    *up_ptr = [g_stream_up_combined contents];
+    *down_ptr = [g_stream_down_combined contents];
+    *remap_ptr = (int32_t *)[g_stream_selected_remap contents];
+    return 1;
+}
+
 int ds4_gpu_routed_moe_one_streamed(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,
@@ -13323,7 +13364,8 @@ int ds4_gpu_routed_moe_one_streamed(
         const ds4_gpu_tensor *weights,
         uint32_t                n_expert,
         float                   clamp,
-        const ds4_gpu_tensor *x) {
+        const ds4_gpu_tensor *x,
+        bool                    pre_staged) {
     (void)expert_stride;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out || !gate || !up || !mid || !x || !selected || !weights ||
@@ -13333,48 +13375,25 @@ int ds4_gpu_routed_moe_one_streamed(
     if ((expert_in_dim % 256u) != 0 || (expert_mid_dim % 256u) != 0) return 0;
 
     @autoreleasepool {
-        // Ensure combined staging buffers are large enough
-        const uint64_t need_gate = (uint64_t)n_expert * gate_expert_bytes;
-        const uint64_t need_down = (uint64_t)n_expert * down_expert_bytes;
-
-        if (!g_stream_gate_combined || g_stream_gate_cap < need_gate) {
-            g_stream_gate_combined = [g_device newBufferWithLength:(NSUInteger)need_gate
-                                                          options:MTLResourceStorageModeShared];
-            g_stream_up_combined = [g_device newBufferWithLength:(NSUInteger)need_gate
-                                                        options:MTLResourceStorageModeShared];
-            g_stream_gate_cap = need_gate;
-            if (!g_stream_gate_combined || !g_stream_up_combined) {
-                fprintf(stderr, "ds4: failed to allocate stream gate/up staging buffers\n");
+        if (!pre_staged) {
+            void *gp, *up_p, *dp;
+            int32_t *rp;
+            if (!ds4_gpu_prepare_stream_staging(n_expert, gate_expert_bytes,
+                                                 down_expert_bytes,
+                                                 &gp, &up_p, &dp, &rp)) {
+                fprintf(stderr, "ds4: failed to allocate stream staging buffers\n");
                 return 0;
             }
-        }
-        if (!g_stream_down_combined || g_stream_down_cap < need_down) {
-            g_stream_down_combined = [g_device newBufferWithLength:(NSUInteger)need_down
-                                                          options:MTLResourceStorageModeShared];
-            g_stream_down_cap = need_down;
-            if (!g_stream_down_combined) {
-                fprintf(stderr, "ds4: failed to allocate stream down staging buffer\n");
-                return 0;
+            uint8_t *gate_dst = (uint8_t *)gp;
+            uint8_t *up_dst = (uint8_t *)up_p;
+            uint8_t *down_dst_ptr = (uint8_t *)dp;
+            for (uint32_t k = 0; k < n_expert; k++) {
+                const uint8_t *src = (const uint8_t *)g_expert_dma_ptrs[k];
+                memcpy(gate_dst + k * gate_expert_bytes, src, gate_expert_bytes);
+                memcpy(up_dst + k * gate_expert_bytes, src + gate_bytes, gate_expert_bytes);
+                memcpy(down_dst_ptr + k * down_expert_bytes, src + gate_bytes + up_bytes, down_expert_bytes);
+                rp[k] = (int32_t)k;
             }
-        }
-        if (!g_stream_selected_remap) {
-            g_stream_selected_remap = [g_device newBufferWithLength:DS4_EXPERT_DMA_SLOTS * sizeof(int32_t)
-                                                           options:MTLResourceStorageModeShared];
-            if (!g_stream_selected_remap) return 0;
-        }
-
-        // Copy from DMA buffers into combined staging buffers and write remapped indices
-        uint8_t *gate_dst = (uint8_t *)[g_stream_gate_combined contents];
-        uint8_t *up_dst = (uint8_t *)[g_stream_up_combined contents];
-        uint8_t *down_dst_ptr = (uint8_t *)[g_stream_down_combined contents];
-        int32_t *remap = (int32_t *)[g_stream_selected_remap contents];
-
-        for (uint32_t k = 0; k < n_expert; k++) {
-            const uint8_t *src = (const uint8_t *)g_expert_dma_ptrs[k];
-            memcpy(gate_dst + k * gate_expert_bytes, src, gate_expert_bytes);
-            memcpy(up_dst + k * gate_expert_bytes, src + gate_bytes, gate_expert_bytes);
-            memcpy(down_dst_ptr + k * down_expert_bytes, src + gate_bytes + up_bytes, down_expert_bytes);
-            remap[k] = (int32_t)k;
         }
 
         id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);

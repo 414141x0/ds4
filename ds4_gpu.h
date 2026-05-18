@@ -698,6 +698,12 @@ int ds4_gpu_init_expert_streaming(uint64_t expert_stride);
 void *ds4_gpu_expert_dma_ptr(int slot);
 int ds4_gpu_expert_dma_slot_count(void);
 
+int ds4_gpu_prepare_stream_staging(uint32_t n_expert,
+                                    uint64_t gate_expert_bytes,
+                                    uint64_t down_expert_bytes,
+                                    void **gate_ptr, void **up_ptr, void **down_ptr,
+                                    int32_t **remap_ptr);
+
 int ds4_gpu_routed_moe_one_streamed(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,
@@ -720,7 +726,8 @@ int ds4_gpu_routed_moe_one_streamed(
         const ds4_gpu_tensor *weights,
         uint32_t                n_expert,
         float                   clamp,
-        const ds4_gpu_tensor *x);
+        const ds4_gpu_tensor *x,
+        bool                    pre_staged);
 
 /* =========================================================================
  * Hyper-Connection Kernels.

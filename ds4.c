@@ -175,6 +175,36 @@ static void stream_build_expert_tasks(
     }
 }
 
+static void stream_build_expert_tasks_staged(
+        ds4_io_task *tasks, int *n_tasks,
+        uint32_t il, const int32_t *selected, int n_sel,
+        uint8_t *gate_dst, uint8_t *up_dst, uint8_t *down_dst) {
+    for (int k = 0; k < n_sel; k++) {
+        tasks[k * 3 + 0] = (ds4_io_task){
+            .fd = g_stream_ctx.model_fd,
+            .dst = gate_dst + (uint64_t)k * g_stream_ctx.gate_expert_bytes,
+            .offset = (off_t)(g_stream_ctx.gate_abs[il] +
+                (uint64_t)selected[k] * g_stream_ctx.gate_expert_bytes),
+            .size = (size_t)g_stream_ctx.gate_expert_bytes
+        };
+        tasks[k * 3 + 1] = (ds4_io_task){
+            .fd = g_stream_ctx.model_fd,
+            .dst = up_dst + (uint64_t)k * g_stream_ctx.up_expert_bytes,
+            .offset = (off_t)(g_stream_ctx.up_abs[il] +
+                (uint64_t)selected[k] * g_stream_ctx.up_expert_bytes),
+            .size = (size_t)g_stream_ctx.up_expert_bytes
+        };
+        tasks[k * 3 + 2] = (ds4_io_task){
+            .fd = g_stream_ctx.model_fd,
+            .dst = down_dst + (uint64_t)k * g_stream_ctx.down_expert_bytes,
+            .offset = (off_t)(g_stream_ctx.down_abs[il] +
+                (uint64_t)selected[k] * g_stream_ctx.down_expert_bytes),
+            .size = (size_t)g_stream_ctx.down_expert_bytes
+        };
+    }
+    *n_tasks = n_sel * 3;
+}
+
 #if defined(__GNUC__) || defined(__clang__)
 #define DS4_MAYBE_UNUSED __attribute__((unused))
 #else
@@ -9943,17 +9973,39 @@ static bool metal_graph_encode_decode_layer(
     }
     if (ok && g_stream_ctx.active) {
         ok = ds4_gpu_end_commands() != 0;
+        bool staged = false;
         if (ok) {
             int32_t selected_ids[DS4_N_EXPERT_USED];
             ok = ds4_gpu_tensor_read(g->router_selected, 0, selected_ids,
                                      sizeof(selected_ids)) != 0;
-            if (ok) {
+            if (ok && g_stream_ctx.gguf_direct) {
+                void *gp, *up_p, *dp;
+                int32_t *rp;
+                if (ds4_gpu_prepare_stream_staging(DS4_N_EXPERT_USED,
+                        gate_expert_bytes, down_expert_bytes,
+                        &gp, &up_p, &dp, &rp)) {
+                    ds4_io_task tasks[DS4_IO_MAX_TASKS];
+                    int n_tasks = 0;
+                    stream_build_expert_tasks_staged(tasks, &n_tasks, il,
+                                                     selected_ids, DS4_N_EXPERT_USED,
+                                                     (uint8_t *)gp, (uint8_t *)up_p,
+                                                     (uint8_t *)dp);
+                    ds4_io_pool_dispatch(
+                        (ds4_io_pool *)g_stream_ctx.io_pool, tasks, n_tasks);
+                    for (int k = 0; k < DS4_N_EXPERT_USED; k++)
+                        rp[k] = (int32_t)k;
+                    staged = true;
+                }
+            }
+            if (ok && !staged) {
                 ds4_io_task tasks[DS4_IO_MAX_TASKS];
                 int n_tasks = 0;
                 stream_build_expert_tasks(tasks, &n_tasks, il,
                                           selected_ids, DS4_N_EXPERT_USED);
                 ds4_io_pool_dispatch(
                     (ds4_io_pool *)g_stream_ctx.io_pool, tasks, n_tasks);
+            }
+            if (ok) {
                 memcpy(g_stream_ctx.prev_selected[il], selected_ids,
                        sizeof(int32_t) * DS4_N_EXPERT_USED);
                 if (il == DS4_N_LAYER - 1)
@@ -9979,7 +10031,7 @@ static bool metal_graph_encode_decode_layer(
                          (uint32_t)routed_out_dim,
                          g->router_selected, g->router_weights,
                          DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP,
-                         g->ffn_norm) != 0;
+                         g->ffn_norm, staged) != 0;
     } else if (ok) {
         ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
                                                  g->routed_gate,
@@ -12799,15 +12851,34 @@ static bool metal_graph_encode_layer_ffn_batch(
             }
         }
 
+        void *pfill_gp = NULL, *pfill_up = NULL, *pfill_dp = NULL;
+        int32_t *pfill_rp = NULL;
+        bool pfill_staged = ok && g_stream_ctx.gguf_direct &&
+            ds4_gpu_prepare_stream_staging(DS4_N_EXPERT_USED,
+                gate_expert_bytes, down_expert_bytes,
+                &pfill_gp, &pfill_up, &pfill_dp, &pfill_rp);
+
         for (uint32_t t = 0; t < n_tokens && ok; t++) {
             const int32_t *tok_sel = pfill_selected + (size_t)t * DS4_N_EXPERT_USED;
 
             ds4_io_task tasks[DS4_IO_MAX_TASKS];
             int n_tasks = 0;
-            stream_build_expert_tasks(tasks, &n_tasks, il,
-                                      tok_sel, DS4_N_EXPERT_USED);
-            ds4_io_pool_dispatch((ds4_io_pool *)g_stream_ctx.io_pool,
-                                 tasks, n_tasks);
+            if (pfill_staged) {
+                stream_build_expert_tasks_staged(tasks, &n_tasks, il,
+                                                  tok_sel, DS4_N_EXPERT_USED,
+                                                  (uint8_t *)pfill_gp,
+                                                  (uint8_t *)pfill_up,
+                                                  (uint8_t *)pfill_dp);
+                ds4_io_pool_dispatch((ds4_io_pool *)g_stream_ctx.io_pool,
+                                     tasks, n_tasks);
+                for (int k = 0; k < DS4_N_EXPERT_USED; k++)
+                    pfill_rp[k] = (int32_t)k;
+            } else {
+                stream_build_expert_tasks(tasks, &n_tasks, il,
+                                          tok_sel, DS4_N_EXPERT_USED);
+                ds4_io_pool_dispatch((ds4_io_pool *)g_stream_ctx.io_pool,
+                                     tasks, n_tasks);
+            }
 
             const uint64_t embd_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
             ds4_gpu_tensor *x_view = ds4_gpu_tensor_view(g->batch_ffn_norm,
@@ -12839,7 +12910,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                              g->router_selected,
                              wgt_view,
                              DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP,
-                             x_view) != 0;
+                             x_view, pfill_staged) != 0;
             if (ok) ok = ds4_gpu_end_commands() != 0;
 
             ds4_gpu_tensor_free(wgt_view);
