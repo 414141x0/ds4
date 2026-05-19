@@ -729,6 +729,32 @@ int ds4_gpu_routed_moe_one_streamed(
         const ds4_gpu_tensor *x,
         bool                    pre_staged);
 
+int ds4_gpu_routed_moe_one_streamed_pair_swiglu(
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        uint32_t                gate_type,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_expert,
+        float                   clamp,
+        const ds4_gpu_tensor *x);
+
+int ds4_gpu_routed_moe_one_streamed_down(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *experts,
+        uint32_t                down_type,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        uint32_t                n_expert);
+
 /* =========================================================================
  * Hyper-Connection Kernels.
  * =========================================================================

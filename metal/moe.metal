@@ -9,6 +9,11 @@ static constant uchar ds4_metal_kmask_iq2xs[8] = {
     1, 2, 4, 8, 16, 32, 64, 128
 };
 
+static inline float ds4_sign_grid(uchar grid_val, uchar signs, short j) {
+    return as_type<float>(as_type<uint>((float)grid_val) ^ (((uint)(signs >> j) & 1u) << 31));
+}
+
+
 static constant uchar ds4_metal_ksigns_iq2xs[128] = {
       0, 129, 130,   3, 132,   5,   6, 135, 136,   9,  10, 139,  12, 141, 142,  15,
     144,  17,  18, 147,  20, 149, 150,  23,  24, 153, 154,  27, 156,  29,  30, 159,
@@ -255,12 +260,12 @@ void dequantize_iq2_xxs(device const block_iq2_xxs * xb, short il, thread type4x
     constant uint8_t * grid = (constant uint8_t *)(iq2xxs_grid + aux8[2*il+0]);
     uint8_t signs = ksigns_iq2xs[(aux32_s >> 14*il) & 127];
     for (int i = 0; i < 8; ++i) {
-        reg[i/4][i%4] = dl * grid[i] * (signs & kmask_iq2xs[i] ? -1.f : 1.f);
+        reg[i/4][i%4] = dl * ds4_sign_grid(grid[i], signs, (short)i);
     }
     grid = (constant uint8_t *)(iq2xxs_grid + aux8[2*il+1]);
     signs = ksigns_iq2xs[(aux32_s >> (14*il+7)) & 127];
     for (int i = 0; i < 8; ++i) {
-        reg[2+i/4][i%4] = dl * grid[i] * (signs & kmask_iq2xs[i] ? -1.f : 1.f);
+        reg[2+i/4][i%4] = dl * ds4_sign_grid(grid[i], signs, (short)i);
     }
 }
 
@@ -591,7 +596,7 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
                 const threadgroup uint8_t * grid = (const threadgroup uint8_t *)(svalues + aux8[l]);
                 const uint8_t signs = ssigns[(aux32 >> 7*l) & 127];
                 for (short j = 0; j < 8; ++j) {
-                    sum += yl[8*l + j] * grid[j] * (signs & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                    sum += yl[8*l + j] * ds4_sign_grid(grid[j], signs, j);
                 }
             }
             sumf[row] += d * sum;
@@ -698,8 +703,8 @@ void kernel_mul_mv_iq2_xxs_pair_f32_impl(
                 const uint8_t signu = ssigns[(aux32u >> 7*l) & 127];
                 for (short j = 0; j < 8; ++j) {
                     const float v = yl[8*l + j];
-                    sg += v * gridg[j] * (signg & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
-                    su += v * gridu[j] * (signu & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                    sg += v * ds4_sign_grid(gridg[j], signg, j);
+                    su += v * ds4_sign_grid(gridu[j], signu, j);
                 }
             }
             sumg[row] += dg * sg;
@@ -1044,8 +1049,8 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
                 const uint8_t signu = ssigns[(aux32u >> 7 * l) & 127];
                 for (short j = 0; j < 8; ++j) {
                     const float v = yl[8 * l + j];
-                    sg += v * gridg[j] * (signg & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
-                    su += v * gridu[j] * (signu & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                    sg += v * ds4_sign_grid(gridg[j], signg, j);
+                    su += v * ds4_sign_grid(gridu[j], signu, j);
                 }
             }
             sumg[row] += dg * sg;
