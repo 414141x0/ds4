@@ -557,18 +557,6 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
 
     const int nb32 = nb * (QK_K / 32);
 
-    threadgroup uint64_t * svalues = (threadgroup uint64_t *)(shmem);
-    threadgroup uint8_t  * ssigns  = (threadgroup uint8_t  *)(svalues + 256);
-    {
-        int nval = 4;
-        int pos  = (32*sgitg + tiisg)*nval;
-        for (int i = 0; i < nval; ++i) svalues[pos + i] = ds4_metal_iq2xxs_grid[pos + i];
-        nval = 2;
-        pos  = (32*sgitg + tiisg)*nval;
-        for (int i = 0; i < nval; ++i) ssigns[pos+i] = ds4_metal_ksigns_iq2xs[pos+i];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
     const int ix = tiisg;
 
     device const float * y4 = y + 32 * ix;
@@ -593,8 +581,8 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
 
             float sum = 0;
             for (short l = 0; l < 4; ++l) {
-                const threadgroup uint8_t * grid = (const threadgroup uint8_t *)(svalues + aux8[l]);
-                const uint8_t signs = ssigns[(aux32 >> 7*l) & 127];
+                constant const uint8_t * grid = (constant const uint8_t *)(ds4_metal_iq2xxs_grid + aux8[l]);
+                const uint8_t signs = ds4_metal_ksigns_iq2xs[(aux32 >> 7*l) & 127];
                 for (short j = 0; j < 8; ++j) {
                     sum += yl[8*l + j] * ds4_sign_grid(grid[j], signs, j);
                 }
@@ -656,18 +644,6 @@ void kernel_mul_mv_iq2_xxs_pair_f32_impl(
 
     const int nb32 = nb * (QK_K / 32);
 
-    threadgroup uint64_t * svalues = (threadgroup uint64_t *)(shmem);
-    threadgroup uint8_t  * ssigns  = (threadgroup uint8_t  *)(svalues + 256);
-    {
-        int nval = 4;
-        int pos  = (32*sgitg + tiisg)*nval;
-        for (int i = 0; i < nval; ++i) svalues[pos + i] = ds4_metal_iq2xxs_grid[pos + i];
-        nval = 2;
-        pos  = (32*sgitg + tiisg)*nval;
-        for (int i = 0; i < nval; ++i) ssigns[pos+i] = ds4_metal_ksigns_iq2xs[pos+i];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
     const int ix = tiisg;
     device const float * y4 = y + 32 * ix;
 
@@ -697,10 +673,10 @@ void kernel_mul_mv_iq2_xxs_pair_f32_impl(
             float sg = 0;
             float su = 0;
             for (short l = 0; l < 4; ++l) {
-                const threadgroup uint8_t * gridg = (const threadgroup uint8_t *)(svalues + aux8g[l]);
-                const threadgroup uint8_t * gridu = (const threadgroup uint8_t *)(svalues + aux8u[l]);
-                const uint8_t signg = ssigns[(aux32g >> 7*l) & 127];
-                const uint8_t signu = ssigns[(aux32u >> 7*l) & 127];
+                constant const uint8_t * gridg = (constant const uint8_t *)(ds4_metal_iq2xxs_grid + aux8g[l]);
+                constant const uint8_t * gridu = (constant const uint8_t *)(ds4_metal_iq2xxs_grid + aux8u[l]);
+                const uint8_t signg = ds4_metal_ksigns_iq2xs[(aux32g >> 7*l) & 127];
+                const uint8_t signu = ds4_metal_ksigns_iq2xs[(aux32u >> 7*l) & 127];
                 for (short j = 0; j < 8; ++j) {
                     const float v = yl[8*l + j];
                     sg += v * ds4_sign_grid(gridg[j], signg, j);
@@ -1002,18 +978,6 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
     float sumg[N_R0_IQ2_XXS] = {0.f};
     float sumu[N_R0_IQ2_XXS] = {0.f};
 
-    threadgroup uint64_t *svalues = (threadgroup uint64_t *)(shmem);
-    threadgroup uint8_t  *ssigns  = (threadgroup uint8_t *)(svalues + 256);
-    {
-        int nval = 4;
-        int pos = (32 * sgitg + tiisg) * nval;
-        for (int i = 0; i < nval; ++i) svalues[pos + i] = ds4_metal_iq2xxs_grid[pos + i];
-        nval = 2;
-        pos = (32 * sgitg + tiisg) * nval;
-        for (int i = 0; i < nval; ++i) ssigns[pos + i] = ds4_metal_ksigns_iq2xs[pos + i];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
     const int ix = tiisg;
     device const float *y4 = y + 32 * ix;
 
@@ -1043,10 +1007,10 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
             float sg = 0;
             float su = 0;
             for (short l = 0; l < 4; ++l) {
-                const threadgroup uint8_t *gridg = (const threadgroup uint8_t *)(svalues + aux8g[l]);
-                const threadgroup uint8_t *gridu = (const threadgroup uint8_t *)(svalues + aux8u[l]);
-                const uint8_t signg = ssigns[(aux32g >> 7 * l) & 127];
-                const uint8_t signu = ssigns[(aux32u >> 7 * l) & 127];
+                constant const uint8_t *gridg = (constant const uint8_t *)(ds4_metal_iq2xxs_grid + aux8g[l]);
+                constant const uint8_t *gridu = (constant const uint8_t *)(ds4_metal_iq2xxs_grid + aux8u[l]);
+                const uint8_t signg = ds4_metal_ksigns_iq2xs[(aux32g >> 7 * l) & 127];
+                const uint8_t signu = ds4_metal_ksigns_iq2xs[(aux32u >> 7 * l) & 127];
                 for (short j = 0; j < 8; ++j) {
                     const float v = yl[8 * l + j];
                     sg += v * ds4_sign_grid(gridg[j], signg, j);

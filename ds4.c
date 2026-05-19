@@ -9353,24 +9353,32 @@ static bool metal_graph_encode_decode_layer(
     /* Speculative prefetch: at layer start, advise the kernel to begin reading
      * experts this layer used on the previous token.  The entire attention +
      * norm compute (~3-5ms) runs before we need the pread results, giving the
-     * kernel enough lead time to pull pages from SSD into the page cache. */
+     * kernel enough lead time to pull pages from SSD into the page cache.
+     * Stride at 512KB because kern.speculative_prefetch_max_iosize caps each
+     * F_RDADVISE call to 512KB — without striding, only ~20% gets prefetched. */
     if (g_stream_ctx.active && g_stream_ctx.gguf_direct && g_stream_ctx.prev_valid) {
+        static const int ADVISE_CHUNK = 512 * 1024;
         for (int pk = 0; pk < DS4_N_EXPERT_USED; pk++) {
             int32_t pe = g_stream_ctx.prev_selected[il][pk];
             if (pe < 0 || pe >= DS4_N_EXPERT) continue;
-            struct radvisory ra;
-            ra.ra_offset = (off_t)(g_stream_ctx.gate_abs[il] +
-                (uint64_t)pe * g_stream_ctx.gate_expert_bytes);
-            ra.ra_count  = (int)g_stream_ctx.gate_expert_bytes;
-            fcntl(g_stream_ctx.model_fd, F_RDADVISE, &ra);
-            ra.ra_offset = (off_t)(g_stream_ctx.up_abs[il] +
-                (uint64_t)pe * g_stream_ctx.up_expert_bytes);
-            ra.ra_count  = (int)g_stream_ctx.up_expert_bytes;
-            fcntl(g_stream_ctx.model_fd, F_RDADVISE, &ra);
-            ra.ra_offset = (off_t)(g_stream_ctx.down_abs[il] +
-                (uint64_t)pe * g_stream_ctx.down_expert_bytes);
-            ra.ra_count  = (int)g_stream_ctx.down_expert_bytes;
-            fcntl(g_stream_ctx.model_fd, F_RDADVISE, &ra);
+            off_t bases[3] = {
+                (off_t)(g_stream_ctx.gate_abs[il] + (uint64_t)pe * g_stream_ctx.gate_expert_bytes),
+                (off_t)(g_stream_ctx.up_abs[il]   + (uint64_t)pe * g_stream_ctx.up_expert_bytes),
+                (off_t)(g_stream_ctx.down_abs[il]  + (uint64_t)pe * g_stream_ctx.down_expert_bytes),
+            };
+            int sizes[3] = {
+                (int)g_stream_ctx.gate_expert_bytes,
+                (int)g_stream_ctx.up_expert_bytes,
+                (int)g_stream_ctx.down_expert_bytes,
+            };
+            for (int c = 0; c < 3; c++) {
+                for (int off = 0; off < sizes[c]; off += ADVISE_CHUNK) {
+                    struct radvisory ra;
+                    ra.ra_offset = bases[c] + off;
+                    ra.ra_count  = sizes[c] - off < ADVISE_CHUNK ? sizes[c] - off : ADVISE_CHUNK;
+                    fcntl(g_stream_ctx.model_fd, F_RDADVISE, &ra);
+                }
+            }
         }
     }
 
@@ -12868,27 +12876,34 @@ static bool metal_graph_encode_layer_ffn_batch(
 
         /* Pre-warm page cache for unique experts via F_RDADVISE.
          * This is non-blocking — the kernel starts fetching pages
-         * so subsequent per-token preads hit warm cache. */
+         * so subsequent per-token preads hit warm cache.
+         * Stride at 512KB per kern.speculative_prefetch_max_iosize. */
         if (ok && g_stream_ctx.gguf_direct) {
+            static const int ADVISE_CHUNK = 512 * 1024;
             bool seen[DS4_N_EXPERT] = {false};
             for (uint32_t t = 0; t < n_tokens; t++) {
                 for (int k = 0; k < DS4_N_EXPERT_USED; k++) {
                     int32_t e = pfill_selected[(size_t)t * DS4_N_EXPERT_USED + k];
                     if (e >= 0 && e < DS4_N_EXPERT && !seen[e]) {
                         seen[e] = true;
-                        struct radvisory ra;
-                        ra.ra_offset = (off_t)(g_stream_ctx.gate_abs[il] +
-                            (uint64_t)e * g_stream_ctx.gate_expert_bytes);
-                        ra.ra_count = (int)g_stream_ctx.gate_expert_bytes;
-                        fcntl(g_stream_ctx.model_fd, F_RDADVISE, &ra);
-                        ra.ra_offset = (off_t)(g_stream_ctx.up_abs[il] +
-                            (uint64_t)e * g_stream_ctx.up_expert_bytes);
-                        ra.ra_count = (int)g_stream_ctx.up_expert_bytes;
-                        fcntl(g_stream_ctx.model_fd, F_RDADVISE, &ra);
-                        ra.ra_offset = (off_t)(g_stream_ctx.down_abs[il] +
-                            (uint64_t)e * g_stream_ctx.down_expert_bytes);
-                        ra.ra_count = (int)g_stream_ctx.down_expert_bytes;
-                        fcntl(g_stream_ctx.model_fd, F_RDADVISE, &ra);
+                        off_t bases[3] = {
+                            (off_t)(g_stream_ctx.gate_abs[il] + (uint64_t)e * g_stream_ctx.gate_expert_bytes),
+                            (off_t)(g_stream_ctx.up_abs[il]   + (uint64_t)e * g_stream_ctx.up_expert_bytes),
+                            (off_t)(g_stream_ctx.down_abs[il]  + (uint64_t)e * g_stream_ctx.down_expert_bytes),
+                        };
+                        int sizes[3] = {
+                            (int)g_stream_ctx.gate_expert_bytes,
+                            (int)g_stream_ctx.up_expert_bytes,
+                            (int)g_stream_ctx.down_expert_bytes,
+                        };
+                        for (int c = 0; c < 3; c++) {
+                            for (int off = 0; off < sizes[c]; off += ADVISE_CHUNK) {
+                                struct radvisory ra;
+                                ra.ra_offset = bases[c] + off;
+                                ra.ra_count  = sizes[c] - off < ADVISE_CHUNK ? sizes[c] - off : ADVISE_CHUNK;
+                                fcntl(g_stream_ctx.model_fd, F_RDADVISE, &ra);
+                            }
+                        }
                     }
                 }
             }
@@ -17721,6 +17736,8 @@ static bool expert_streaming_init_gguf(ds4_engine *e) {
         fprintf(stderr, "ds4: failed to create I/O thread pool\n");
         return false;
     }
+
+    fcntl(g_stream_ctx.model_fd, F_RDAHEAD, 1);
 
     g_stream_ctx.gguf_direct = true;
     g_stream_ctx.active = true;

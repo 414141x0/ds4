@@ -2684,7 +2684,32 @@ int ds4_gpu_init(void) {
         }
         ds4_gpu_print_device_summary();
 
-        g_queue = [g_device newCommandQueue];
+        {
+            Class qdcls = NSClassFromString(@"MTLCommandQueueDescriptorInternal");
+            id qdesc = qdcls ? [[qdcls alloc] init] : nil;
+            if (qdesc) {
+                @try {
+                    [qdesc setValue:@YES forKey:@"enableLowLatencySignalSharedEvent"];
+                    [qdesc setValue:@YES forKey:@"enableLowLatencyWaitSharedEvent"];
+                    [qdesc setValue:@YES forKey:@"disableCrossQueueHazardTracking"];
+                } @catch (NSException *e) { /* ignore missing keys */ }
+                SEL sel = NSSelectorFromString(@"newCommandQueueWithDescriptor:error:");
+                if ([g_device respondsToSelector:sel]) {
+                    NSError *qerr = nil;
+                    NSMethodSignature *sig = [(NSObject *)g_device methodSignatureForSelector:sel];
+                    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                    [inv setSelector:sel];
+                    [inv setArgument:&qdesc atIndex:2];
+                    [inv setArgument:&qerr atIndex:3];
+                    [inv invokeWithTarget:g_device];
+                    id __unsafe_unretained result = nil;
+                    [inv getReturnValue:&result];
+                    g_queue = result;
+                }
+            }
+        }
+        if (!g_queue)
+            g_queue = [g_device newCommandQueue];
         if (!g_queue) {
             fprintf(stderr, "ds4: failed to create Metal command queue\n");
             g_device = nil;
@@ -2713,6 +2738,7 @@ int ds4_gpu_init(void) {
             return 0;
         }
         MTLCompileOptions *options = [MTLCompileOptions new];
+        options.mathMode = MTLMathModeRelaxed;
         id<MTLLibrary> library = [g_device newLibraryWithSource:source options:options error:&error];
         if (!library) {
             fprintf(stderr, "ds4: Metal shader compilation failed: %s\n",
@@ -11829,9 +11855,7 @@ static uint32_t ds4_gpu_routed_mv_nr0(uint32_t type) {
 }
 
 static NSUInteger ds4_gpu_routed_mv_smem(uint32_t type) {
-    if (type == DS4_METAL_TENSOR_IQ2_XXS) {
-        return 256u * sizeof(uint64_t) + 128u * sizeof(uint8_t);
-    }
+    (void)type;
     return 0;
 }
 
