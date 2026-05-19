@@ -13325,6 +13325,188 @@ static id<MTLBuffer> g_stream_selected_remap;
 static uint64_t g_stream_gate_cap;
 static uint64_t g_stream_down_cap;
 
+// MTLIOCommandQueue for hardware-accelerated expert loading
+static id<MTLIOCommandQueue> g_io_queue;
+static id<MTLSharedEvent> g_io_event;
+static uint64_t g_io_event_value;
+#define DS4_IO_MAX_HANDLES 44
+static id<MTLIOFileHandle> g_io_handles[DS4_IO_MAX_HANDLES];
+static int g_io_n_handles;
+static bool g_io_queue_active;
+
+int ds4_gpu_io_queue_available(void) {
+    return g_io_queue_active ? 1 : 0;
+}
+
+static bool ds4_gpu_io_init_queue(void) {
+    if (g_io_queue) return true;
+    if (!g_device) return false;
+
+    @autoreleasepool {
+        MTLIOCommandQueueDescriptor *desc = [[MTLIOCommandQueueDescriptor alloc] init];
+        desc.type = MTLIOCommandQueueTypeConcurrent;
+        desc.priority = MTLIOPriorityHigh;
+        desc.maxCommandsInFlight = 0;
+        NSError *err = nil;
+        g_io_queue = [g_device newIOCommandQueueWithDescriptor:desc error:&err];
+        if (!g_io_queue) {
+            fprintf(stderr, "ds4: MTLIOCommandQueue creation failed: %s\n",
+                    err ? [[err localizedDescription] UTF8String] : "unknown");
+            return false;
+        }
+        g_io_event = [g_device newSharedEvent];
+        if (!g_io_event) {
+            g_io_queue = nil;
+            return false;
+        }
+        g_io_event_value = 0;
+        fprintf(stderr, "ds4: MTLIOCommandQueue created (concurrent, high priority)\n");
+        return true;
+    }
+}
+
+int ds4_gpu_io_init_gguf(int model_fd) {
+    if (!ds4_gpu_io_init_queue()) return 0;
+    @autoreleasepool {
+        char fd_path[PATH_MAX];
+        if (fcntl(model_fd, F_GETPATH, fd_path) < 0) return 0;
+        NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:fd_path]];
+        NSError *err = nil;
+        g_io_handles[0] = [g_device newIOFileHandleWithURL:url error:&err];
+        if (!g_io_handles[0]) {
+            fprintf(stderr, "ds4: MTLIOFileHandle creation failed: %s\n",
+                    err ? [[err localizedDescription] UTF8String] : "unknown");
+            return 0;
+        }
+        g_io_n_handles = 1;
+        g_io_queue_active = true;
+        fprintf(stderr, "ds4: MTLIOFileHandle opened for GGUF-direct mode\n");
+        return 1;
+    }
+}
+
+int ds4_gpu_io_init_pack(const char *pack_dir, int n_layer) {
+    if (!ds4_gpu_io_init_queue()) return 0;
+    if (n_layer > DS4_IO_MAX_HANDLES) return 0;
+    @autoreleasepool {
+        char path[512];
+        for (int il = 0; il < n_layer; il++) {
+            snprintf(path, sizeof(path), "%s/layer_%02d.bin", pack_dir, il);
+            NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
+            NSError *err = nil;
+            g_io_handles[il] = [g_device newIOFileHandleWithURL:url error:&err];
+            if (!g_io_handles[il]) {
+                fprintf(stderr, "ds4: MTLIOFileHandle failed for %s: %s\n", path,
+                        err ? [[err localizedDescription] UTF8String] : "unknown");
+                for (int j = 0; j < il; j++) g_io_handles[j] = nil;
+                return 0;
+            }
+        }
+        g_io_n_handles = n_layer;
+        g_io_queue_active = true;
+        fprintf(stderr, "ds4: MTLIOFileHandle opened for %d pack layers\n", n_layer);
+        return 1;
+    }
+}
+
+int ds4_gpu_io_load_staged_gate_up(uint32_t il, const int32_t *selected, int n_sel,
+                                    uint64_t gate_expert_bytes, uint64_t up_expert_bytes,
+                                    uint64_t expert_stride, int gguf_direct,
+                                    const uint64_t *gate_abs, const uint64_t *up_abs) {
+    if (!g_io_queue_active || !g_batch_cb) return 0;
+    if (!g_stream_gate_combined || !g_stream_up_combined) return 0;
+
+    @autoreleasepool {
+        id<MTLIOCommandBuffer> iocb = [g_io_queue commandBufferWithUnretainedReferences];
+        if (!iocb) return 0;
+
+        for (int k = 0; k < n_sel; k++) {
+            int32_t eid = selected[k];
+            if (gguf_direct) {
+                id<MTLIOFileHandle> h = g_io_handles[0];
+                [iocb loadBuffer:g_stream_gate_combined
+                          offset:(NSUInteger)(k * gate_expert_bytes)
+                            size:(NSUInteger)gate_expert_bytes
+                    sourceHandle:h
+              sourceHandleOffset:(NSUInteger)(gate_abs[il] + (uint64_t)eid * gate_expert_bytes)];
+                [iocb loadBuffer:g_stream_up_combined
+                          offset:(NSUInteger)(k * up_expert_bytes)
+                            size:(NSUInteger)up_expert_bytes
+                    sourceHandle:h
+              sourceHandleOffset:(NSUInteger)(up_abs[il] + (uint64_t)eid * up_expert_bytes)];
+            } else {
+                id<MTLIOFileHandle> h = g_io_handles[il];
+                NSUInteger base = (NSUInteger)((uint64_t)eid * expert_stride);
+                [iocb loadBuffer:g_stream_gate_combined
+                          offset:(NSUInteger)(k * gate_expert_bytes)
+                            size:(NSUInteger)gate_expert_bytes
+                    sourceHandle:h
+              sourceHandleOffset:base];
+                [iocb loadBuffer:g_stream_up_combined
+                          offset:(NSUInteger)(k * up_expert_bytes)
+                            size:(NSUInteger)up_expert_bytes
+                    sourceHandle:h
+              sourceHandleOffset:base + (NSUInteger)gate_expert_bytes];
+            }
+        }
+
+        uint64_t val = ++g_io_event_value;
+        [iocb signalEvent:g_io_event value:val];
+        [iocb commit];
+
+        ds4_gpu_close_batch_encoder();
+        [g_batch_cb encodeWaitForEvent:g_io_event value:val];
+        return 1;
+    }
+}
+
+int ds4_gpu_io_load_staged_down(uint32_t il, const int32_t *selected, int n_sel,
+                                 uint64_t down_expert_bytes, uint64_t gate_bytes,
+                                 uint64_t up_bytes, uint64_t expert_stride, int gguf_direct,
+                                 const uint64_t *down_abs) {
+    if (!g_io_queue_active || !g_batch_cb) return 0;
+    if (!g_stream_down_combined) return 0;
+
+    @autoreleasepool {
+        id<MTLIOCommandBuffer> iocb = [g_io_queue commandBufferWithUnretainedReferences];
+        if (!iocb) return 0;
+
+        for (int k = 0; k < n_sel; k++) {
+            int32_t eid = selected[k];
+            if (gguf_direct) {
+                [iocb loadBuffer:g_stream_down_combined
+                          offset:(NSUInteger)(k * down_expert_bytes)
+                            size:(NSUInteger)down_expert_bytes
+                    sourceHandle:g_io_handles[0]
+              sourceHandleOffset:(NSUInteger)(down_abs[il] + (uint64_t)eid * down_expert_bytes)];
+            } else {
+                NSUInteger base = (NSUInteger)((uint64_t)eid * expert_stride);
+                [iocb loadBuffer:g_stream_down_combined
+                          offset:(NSUInteger)(k * down_expert_bytes)
+                            size:(NSUInteger)down_expert_bytes
+                    sourceHandle:g_io_handles[il]
+              sourceHandleOffset:base + (NSUInteger)gate_bytes + (NSUInteger)up_bytes];
+            }
+        }
+
+        uint64_t val = ++g_io_event_value;
+        [iocb signalEvent:g_io_event value:val];
+        [iocb commit];
+
+        ds4_gpu_close_batch_encoder();
+        [g_batch_cb encodeWaitForEvent:g_io_event value:val];
+        return 1;
+    }
+}
+
+void ds4_gpu_io_close(void) {
+    g_io_queue_active = false;
+    for (int i = 0; i < g_io_n_handles; i++) g_io_handles[i] = nil;
+    g_io_n_handles = 0;
+    g_io_event = nil;
+    g_io_queue = nil;
+}
+
 int ds4_gpu_prepare_stream_staging(uint32_t n_expert,
                                     uint64_t gate_expert_bytes,
                                     uint64_t down_expert_bytes,

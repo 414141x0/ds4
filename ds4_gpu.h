@@ -704,6 +704,21 @@ int ds4_gpu_prepare_stream_staging(uint32_t n_expert,
                                     void **gate_ptr, void **up_ptr, void **down_ptr,
                                     int32_t **remap_ptr);
 
+/* MTLIOCommandQueue-based expert loading (replaces pread thread pool).
+ * Returns 1 if IO queue is active and commands were encoded, 0 on fallback. */
+int ds4_gpu_io_queue_available(void);
+int ds4_gpu_io_init_gguf(int model_fd);
+int ds4_gpu_io_init_pack(const char *pack_dir, int n_layer);
+int ds4_gpu_io_load_staged_gate_up(uint32_t il, const int32_t *selected, int n_sel,
+                                    uint64_t gate_expert_bytes, uint64_t up_expert_bytes,
+                                    uint64_t expert_stride, int gguf_direct,
+                                    const uint64_t *gate_abs, const uint64_t *up_abs);
+int ds4_gpu_io_load_staged_down(uint32_t il, const int32_t *selected, int n_sel,
+                                 uint64_t down_expert_bytes, uint64_t gate_bytes,
+                                 uint64_t up_bytes, uint64_t expert_stride, int gguf_direct,
+                                 const uint64_t *down_abs);
+void ds4_gpu_io_close(void);
+
 int ds4_gpu_routed_moe_one_streamed(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,
