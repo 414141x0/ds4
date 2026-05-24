@@ -30,6 +30,7 @@
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <stdarg.h>
 #include <time.h>
 #include <unistd.h>
@@ -133,6 +134,207 @@ typedef struct {
 } ds4_expert_stream_ctx;
 
 static ds4_expert_stream_ctx g_stream_ctx;
+static ds4_memory_budget g_memory_budget;
+
+static uint32_t ds4_layer_compress_ratio(uint32_t il);
+static void *xmalloc(size_t size);
+static void *xcalloc(size_t n, size_t size);
+
+static uint64_t ds4_system_memory_bytes(void) {
+    uint64_t bytes = 0;
+    size_t len = sizeof(bytes);
+    if (sysctlbyname("hw.memsize", &bytes, &len, NULL, 0) != 0) return 0;
+    return len == sizeof(bytes) ? bytes : 0;
+}
+
+#define DS4_MEMORY_BUDGET_DEFAULT_PCT 75
+
+static ds4_memory_budget ds4_compute_memory_budget(uint64_t total_system,
+                                                   uint64_t model_mapped_bytes,
+                                                   uint64_t expert_stride,
+                                                   int ctx_size) {
+    ds4_memory_budget b = {0};
+    b.total_system = total_system;
+
+    const char *pct_env = getenv("DS4_MEMORY_BUDGET_PCT");
+    int pct = pct_env ? atoi(pct_env) : DS4_MEMORY_BUDGET_DEFAULT_PCT;
+    if (pct < 50) pct = 50;
+    if (pct > 95) pct = 95;
+    b.budget = (uint64_t)((double)total_system * pct / 100.0);
+
+    b.model_mapped = model_mapped_bytes;
+
+    uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 131072u;
+    uint32_t min_ratio = UINT32_MAX;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio != 0 && ratio < min_ratio) min_ratio = ratio;
+    }
+    if (min_ratio == UINT32_MAX) min_ratio = 4;
+    uint32_t raw_cap = DS4_N_SWA + 2048u;
+    if (raw_cap > 8192u) raw_cap = 8192u;
+
+    b.kv_cache = (uint64_t)DS4_N_LAYER * raw_cap * DS4_N_HEAD_DIM * sizeof(float);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        uint32_t layer_comp = ctx / ratio + 2u;
+        b.kv_cache += (uint64_t)layer_comp * DS4_N_HEAD_DIM * sizeof(float);
+        if (ratio == 4)
+            b.kv_cache += (uint64_t)layer_comp * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+    }
+
+    b.compute_scratch = 256ull * 1024 * 1024;
+
+    uint64_t used = b.model_mapped + b.kv_cache + b.compute_scratch;
+    if (used >= b.budget) {
+        b.expert_cache = 0;
+        b.expert_cache_slots = 0;
+    } else {
+        b.expert_cache = b.budget - used;
+        if (expert_stride > 0)
+            b.expert_cache_slots = (uint32_t)(b.expert_cache / expert_stride);
+        else
+            b.expert_cache_slots = 0;
+    }
+
+    b.max_ctx = ctx;
+    return b;
+}
+
+/* ---- Expert LRU Cache ---- */
+
+typedef struct {
+    uint16_t layer;
+    uint16_t expert_id;
+    uint64_t last_access;
+    uint32_t access_count;
+} ds4_expert_cache_slot;
+
+typedef struct {
+    int16_t *lookup;              /* [DS4_N_LAYER * DS4_N_EXPERT] → slot index or -1 */
+    ds4_expert_cache_slot *slots;
+    void **buffers;               /* [n_slots] raw pointers (2MB-aligned, shared) */
+    uint32_t n_slots;
+    uint32_t n_used;
+    uint64_t tick;
+    uint64_t stride;
+    uint64_t hits;
+    uint64_t misses;
+} ds4_expert_cache;
+
+static ds4_expert_cache g_expert_cache;
+
+static void ds4_expert_cache_init(uint32_t n_slots, uint64_t expert_stride) {
+    if (n_slots == 0 || expert_stride == 0) return;
+    const size_t alignment = 2u * 1024u * 1024u;
+    uint64_t alloc_size = (expert_stride + alignment - 1) / alignment * alignment;
+
+    size_t lookup_bytes = (size_t)DS4_N_LAYER * DS4_N_EXPERT * sizeof(int16_t);
+    g_expert_cache.lookup = (int16_t *)xmalloc(lookup_bytes);
+    memset(g_expert_cache.lookup, 0xFF, lookup_bytes);
+
+    g_expert_cache.slots = (ds4_expert_cache_slot *)xcalloc(n_slots, sizeof(ds4_expert_cache_slot));
+    g_expert_cache.buffers = (void **)xcalloc(n_slots, sizeof(void *));
+
+    uint32_t allocated = 0;
+    for (uint32_t i = 0; i < n_slots; i++) {
+        void *ptr = NULL;
+        if (posix_memalign(&ptr, alignment, (size_t)alloc_size) != 0 || !ptr) break;
+        g_expert_cache.buffers[i] = ptr;
+        allocated++;
+    }
+    g_expert_cache.n_slots = allocated;
+    g_expert_cache.n_used = 0;
+    g_expert_cache.tick = 0;
+    g_expert_cache.stride = alloc_size;
+    g_expert_cache.hits = 0;
+    g_expert_cache.misses = 0;
+
+    if (allocated > 0) {
+        fprintf(stderr, "ds4: expert cache allocated %u slots (%.1f GiB, %.1f%% of %u×%u experts)\n",
+                allocated,
+                (double)allocated * alloc_size / (1024.0 * 1024.0 * 1024.0),
+                100.0 * allocated / (double)(DS4_N_LAYER * DS4_N_EXPERT),
+                (unsigned)DS4_N_LAYER, (unsigned)DS4_N_EXPERT);
+    }
+}
+
+static void ds4_expert_cache_free(void) {
+    if (!g_expert_cache.lookup) return;
+    for (uint32_t i = 0; i < g_expert_cache.n_slots; i++)
+        free(g_expert_cache.buffers[i]);
+    free(g_expert_cache.buffers);
+    free(g_expert_cache.slots);
+    free(g_expert_cache.lookup);
+    memset(&g_expert_cache, 0, sizeof(g_expert_cache));
+}
+
+static inline int16_t ds4_expert_cache_lookup(uint32_t il, uint32_t eid) {
+    if (!g_expert_cache.lookup) return -1;
+    return g_expert_cache.lookup[il * DS4_N_EXPERT + eid];
+}
+
+static uint32_t ds4_expert_cache_evict(void) {
+    uint64_t oldest = UINT64_MAX;
+    uint32_t victim = 0;
+    for (uint32_t i = 0; i < g_expert_cache.n_used; i++) {
+        if (g_expert_cache.slots[i].last_access < oldest) {
+            oldest = g_expert_cache.slots[i].last_access;
+            victim = i;
+        }
+    }
+    int16_t *lk = g_expert_cache.lookup +
+                  g_expert_cache.slots[victim].layer * DS4_N_EXPERT +
+                  g_expert_cache.slots[victim].expert_id;
+    *lk = -1;
+    return victim;
+}
+
+static void *ds4_expert_cache_get(uint32_t il, uint32_t eid) {
+    int16_t slot = ds4_expert_cache_lookup(il, eid);
+    if (slot < 0) return NULL;
+    g_expert_cache.slots[slot].last_access = ++g_expert_cache.tick;
+    g_expert_cache.slots[slot].access_count++;
+    g_expert_cache.hits++;
+    return g_expert_cache.buffers[slot];
+}
+
+static uint32_t ds4_expert_cache_alloc_slot(uint32_t il, uint32_t eid) {
+    uint32_t slot;
+    if (g_expert_cache.n_used < g_expert_cache.n_slots) {
+        slot = g_expert_cache.n_used++;
+    } else {
+        slot = ds4_expert_cache_evict();
+    }
+    g_expert_cache.slots[slot] = (ds4_expert_cache_slot){
+        .layer = (uint16_t)il,
+        .expert_id = (uint16_t)eid,
+        .last_access = ++g_expert_cache.tick,
+        .access_count = 1
+    };
+    g_expert_cache.lookup[il * DS4_N_EXPERT + eid] = (int16_t)slot;
+    g_expert_cache.misses++;
+    return slot;
+}
+
+static void ds4_expert_cache_insert(uint32_t il, uint32_t eid, const void *data) {
+    if (!g_expert_cache.lookup || g_expert_cache.n_slots == 0) return;
+    uint32_t slot = ds4_expert_cache_alloc_slot(il, eid);
+    memcpy(g_expert_cache.buffers[slot], data, (size_t)g_stream_ctx.expert_stride);
+}
+
+static void ds4_expert_cache_insert_parts(uint32_t il, uint32_t eid,
+                                          const void *gate, size_t gate_sz,
+                                          const void *up, size_t up_sz,
+                                          const void *down, size_t down_sz) {
+    if (!g_expert_cache.lookup || g_expert_cache.n_slots == 0) return;
+    uint32_t slot = ds4_expert_cache_alloc_slot(il, eid);
+    uint8_t *dst = (uint8_t *)g_expert_cache.buffers[slot];
+    memcpy(dst, gate, gate_sz);
+    memcpy(dst + g_stream_ctx.gate_bytes, up, up_sz);
+    memcpy(dst + g_stream_ctx.gate_bytes + g_stream_ctx.up_bytes, down, down_sz);
+}
 
 static void stream_build_expert_tasks(
         ds4_io_task *tasks, int *n_tasks,
@@ -10047,21 +10249,78 @@ static bool metal_graph_encode_decode_layer(
                     for (int k = 0; k < DS4_N_EXPERT_USED; k++)
                         rp[k] = (int32_t)k;
 
+                    bool cache_hit_mask[DS4_N_EXPERT_USED] = {false};
+                    int n_cache_hits_gu = 0;
+                    if (g_expert_cache.lookup) {
+                        for (int k = 0; k < DS4_N_EXPERT_USED; k++) {
+                            void *cached = ds4_expert_cache_get(il, (uint32_t)selected_ids[k]);
+                            if (cached) {
+                                const uint8_t *src = (const uint8_t *)cached;
+                                memcpy((uint8_t *)gp + (uint64_t)k * gate_expert_bytes,
+                                       src, (size_t)gate_expert_bytes);
+                                memcpy((uint8_t *)up_p + (uint64_t)k * gate_expert_bytes,
+                                       src + g_stream_ctx.gate_bytes,
+                                       (size_t)g_stream_ctx.up_expert_bytes);
+                                cache_hit_mask[k] = true;
+                                n_cache_hits_gu++;
+                            }
+                        }
+                    }
+
                     ok = ds4_gpu_begin_commands() != 0;
 
-                    if (ok && ds4_gpu_io_queue_available() &&
+                    if (n_cache_hits_gu == DS4_N_EXPERT_USED) {
+                        /* All experts served from cache — no IO needed */
+                    } else if (ok && ds4_gpu_io_queue_available() && n_cache_hits_gu == 0 &&
                         ds4_gpu_io_load_staged_gate_up(il, selected_ids, DS4_N_EXPERT_USED,
                             g_stream_ctx.gate_expert_bytes, g_stream_ctx.up_expert_bytes,
                             g_stream_ctx.expert_stride, g_stream_ctx.gguf_direct,
                             g_stream_ctx.gate_abs, g_stream_ctx.up_abs)) {
                         /* IO queue: async load + GPU wait encoded */
-                    } else if (ok) {
+                    } else if (ok && n_cache_hits_gu < DS4_N_EXPERT_USED) {
                         ds4_io_task tasks[DS4_IO_MAX_TASKS];
                         int n_tasks = 0;
-                        stream_build_expert_tasks_staged_gate_up(
-                            tasks, &n_tasks, il,
-                            selected_ids, DS4_N_EXPERT_USED,
-                            (uint8_t *)gp, (uint8_t *)up_p);
+                        if (g_expert_cache.lookup) {
+                            for (int k = 0; k < DS4_N_EXPERT_USED; k++) {
+                                if (cache_hit_mask[k]) continue;
+                                if (g_stream_ctx.gguf_direct) {
+                                    tasks[n_tasks++] = (ds4_io_task){
+                                        .fd = g_stream_ctx.model_fd,
+                                        .dst = (uint8_t *)gp + (uint64_t)k * gate_expert_bytes,
+                                        .offset = (off_t)(g_stream_ctx.gate_abs[il] +
+                                            (uint64_t)selected_ids[k] * g_stream_ctx.gate_expert_bytes),
+                                        .size = (size_t)g_stream_ctx.gate_expert_bytes
+                                    };
+                                    tasks[n_tasks++] = (ds4_io_task){
+                                        .fd = g_stream_ctx.model_fd,
+                                        .dst = (uint8_t *)up_p + (uint64_t)k * g_stream_ctx.up_expert_bytes,
+                                        .offset = (off_t)(g_stream_ctx.up_abs[il] +
+                                            (uint64_t)selected_ids[k] * g_stream_ctx.up_expert_bytes),
+                                        .size = (size_t)g_stream_ctx.up_expert_bytes
+                                    };
+                                } else {
+                                    const off_t base = (off_t)selected_ids[k] *
+                                                       (off_t)g_stream_ctx.expert_stride;
+                                    tasks[n_tasks++] = (ds4_io_task){
+                                        .fd = g_stream_ctx.fds[il],
+                                        .dst = (uint8_t *)gp + (uint64_t)k * g_stream_ctx.gate_bytes,
+                                        .offset = base,
+                                        .size = (size_t)g_stream_ctx.gate_bytes
+                                    };
+                                    tasks[n_tasks++] = (ds4_io_task){
+                                        .fd = g_stream_ctx.fds[il],
+                                        .dst = (uint8_t *)up_p + (uint64_t)k * g_stream_ctx.up_bytes,
+                                        .offset = base + (off_t)g_stream_ctx.gate_bytes,
+                                        .size = (size_t)g_stream_ctx.up_bytes
+                                    };
+                                }
+                            }
+                        } else {
+                            stream_build_expert_tasks_staged_gate_up(
+                                tasks, &n_tasks, il,
+                                selected_ids, DS4_N_EXPERT_USED,
+                                (uint8_t *)gp, (uint8_t *)up_p);
+                        }
                         ds4_io_pool_dispatch(
                             (ds4_io_pool *)g_stream_ctx.io_pool, tasks, n_tasks);
                     }
@@ -10076,21 +10335,78 @@ static bool metal_graph_encode_decode_layer(
                         g->ffn_norm) != 0;
                     if (ok) ok = ds4_gpu_flush_commands() != 0;
 
-                    if (ok && ds4_gpu_io_queue_available() &&
+                    int n_cache_hits_d = 0;
+                    if (g_expert_cache.lookup) {
+                        for (int k = 0; k < DS4_N_EXPERT_USED; k++) {
+                            if (cache_hit_mask[k]) {
+                                const uint8_t *src = (const uint8_t *)
+                                    g_expert_cache.buffers[
+                                        g_expert_cache.lookup[il * DS4_N_EXPERT + selected_ids[k]]];
+                                memcpy((uint8_t *)dp + (uint64_t)k * down_expert_bytes,
+                                       src + g_stream_ctx.gate_bytes + g_stream_ctx.up_bytes,
+                                       (size_t)down_expert_bytes);
+                                n_cache_hits_d++;
+                            }
+                        }
+                    }
+
+                    if (n_cache_hits_d == DS4_N_EXPERT_USED) {
+                        /* All down experts from cache */
+                    } else if (ok && ds4_gpu_io_queue_available() && n_cache_hits_d == 0 &&
                         ds4_gpu_io_load_staged_down(il, selected_ids, DS4_N_EXPERT_USED,
                             g_stream_ctx.down_expert_bytes, g_stream_ctx.gate_bytes,
                             g_stream_ctx.up_bytes, g_stream_ctx.expert_stride,
                             g_stream_ctx.gguf_direct, g_stream_ctx.down_abs)) {
                         /* IO queue: async down load overlaps with swiglu GPU execution */
-                    } else if (ok) {
+                    } else if (ok && n_cache_hits_d < DS4_N_EXPERT_USED) {
                         ds4_io_task tasks[DS4_IO_MAX_TASKS];
                         int n_tasks = 0;
-                        stream_build_expert_tasks_staged_down(
-                            tasks, &n_tasks, il,
-                            selected_ids, DS4_N_EXPERT_USED,
-                            (uint8_t *)dp);
+                        if (g_expert_cache.lookup) {
+                            for (int k = 0; k < DS4_N_EXPERT_USED; k++) {
+                                if (cache_hit_mask[k]) continue;
+                                if (g_stream_ctx.gguf_direct) {
+                                    tasks[n_tasks++] = (ds4_io_task){
+                                        .fd = g_stream_ctx.model_fd,
+                                        .dst = (uint8_t *)dp + (uint64_t)k * down_expert_bytes,
+                                        .offset = (off_t)(g_stream_ctx.down_abs[il] +
+                                            (uint64_t)selected_ids[k] * g_stream_ctx.down_expert_bytes),
+                                        .size = (size_t)g_stream_ctx.down_expert_bytes
+                                    };
+                                } else {
+                                    const off_t base = (off_t)selected_ids[k] *
+                                                       (off_t)g_stream_ctx.expert_stride;
+                                    tasks[n_tasks++] = (ds4_io_task){
+                                        .fd = g_stream_ctx.fds[il],
+                                        .dst = (uint8_t *)dp + (uint64_t)k * g_stream_ctx.down_bytes,
+                                        .offset = base + (off_t)g_stream_ctx.gate_bytes +
+                                                  (off_t)g_stream_ctx.up_bytes,
+                                        .size = (size_t)g_stream_ctx.down_bytes
+                                    };
+                                }
+                            }
+                        } else {
+                            stream_build_expert_tasks_staged_down(
+                                tasks, &n_tasks, il,
+                                selected_ids, DS4_N_EXPERT_USED,
+                                (uint8_t *)dp);
+                        }
                         ds4_io_pool_dispatch(
                             (ds4_io_pool *)g_stream_ctx.io_pool, tasks, n_tasks);
+                    }
+
+                    if (g_expert_cache.lookup) {
+                        for (int k = 0; k < DS4_N_EXPERT_USED; k++) {
+                            if (!cache_hit_mask[k]) {
+                                ds4_expert_cache_insert_parts(
+                                    il, (uint32_t)selected_ids[k],
+                                    (uint8_t *)gp + (uint64_t)k * gate_expert_bytes,
+                                    (size_t)gate_expert_bytes,
+                                    (uint8_t *)up_p + (uint64_t)k * g_stream_ctx.up_expert_bytes,
+                                    (size_t)g_stream_ctx.up_expert_bytes,
+                                    (uint8_t *)dp + (uint64_t)k * down_expert_bytes,
+                                    (size_t)down_expert_bytes);
+                            }
+                        }
                     }
 
                     if (ok) ok = ds4_gpu_routed_moe_one_streamed_down(
@@ -10105,12 +10421,76 @@ static bool metal_graph_encode_decode_layer(
                 }
             }
             if (ok && !staged) {
-                ds4_io_task tasks[DS4_IO_MAX_TASKS];
-                int n_tasks = 0;
-                stream_build_expert_tasks(tasks, &n_tasks, il,
-                                          selected_ids, DS4_N_EXPERT_USED);
-                ds4_io_pool_dispatch(
-                    (ds4_io_pool *)g_stream_ctx.io_pool, tasks, n_tasks);
+                int32_t uncached_ids[DS4_N_EXPERT_USED];
+                int n_uncached = 0;
+                bool cached_mask[DS4_N_EXPERT_USED] = {false};
+                if (g_expert_cache.lookup) {
+                    for (int k = 0; k < DS4_N_EXPERT_USED; k++) {
+                        void *cached = ds4_expert_cache_get(il, (uint32_t)selected_ids[k]);
+                        if (cached) {
+                            memcpy(ds4_gpu_expert_dma_ptr(k), cached,
+                                   (size_t)g_stream_ctx.expert_stride);
+                            cached_mask[k] = true;
+                        } else {
+                            uncached_ids[n_uncached++] = selected_ids[k];
+                        }
+                    }
+                }
+                if (n_uncached > 0 || !g_expert_cache.lookup) {
+                    ds4_io_task tasks[DS4_IO_MAX_TASKS];
+                    int n_tasks = 0;
+                    if (!g_expert_cache.lookup) {
+                        stream_build_expert_tasks(tasks, &n_tasks, il,
+                                                  selected_ids, DS4_N_EXPERT_USED);
+                    } else {
+                        int slot = 0;
+                        for (int k = 0; k < DS4_N_EXPERT_USED; k++) {
+                            if (cached_mask[k]) continue;
+                            if (g_stream_ctx.gguf_direct) {
+                                uint8_t *dma = (uint8_t *)ds4_gpu_expert_dma_ptr(k);
+                                tasks[slot * 3 + 0] = (ds4_io_task){
+                                    .fd = g_stream_ctx.model_fd, .dst = dma,
+                                    .offset = (off_t)(g_stream_ctx.gate_abs[il] +
+                                        (uint64_t)selected_ids[k] * g_stream_ctx.gate_expert_bytes),
+                                    .size = (size_t)g_stream_ctx.gate_expert_bytes
+                                };
+                                tasks[slot * 3 + 1] = (ds4_io_task){
+                                    .fd = g_stream_ctx.model_fd,
+                                    .dst = dma + g_stream_ctx.gate_bytes,
+                                    .offset = (off_t)(g_stream_ctx.up_abs[il] +
+                                        (uint64_t)selected_ids[k] * g_stream_ctx.up_expert_bytes),
+                                    .size = (size_t)g_stream_ctx.up_expert_bytes
+                                };
+                                tasks[slot * 3 + 2] = (ds4_io_task){
+                                    .fd = g_stream_ctx.model_fd,
+                                    .dst = dma + g_stream_ctx.gate_bytes + g_stream_ctx.up_bytes,
+                                    .offset = (off_t)(g_stream_ctx.down_abs[il] +
+                                        (uint64_t)selected_ids[k] * g_stream_ctx.down_expert_bytes),
+                                    .size = (size_t)g_stream_ctx.down_expert_bytes
+                                };
+                                n_tasks = (slot + 1) * 3;
+                            } else {
+                                tasks[slot] = (ds4_io_task){
+                                    .fd = g_stream_ctx.fds[il],
+                                    .dst = ds4_gpu_expert_dma_ptr(k),
+                                    .offset = (off_t)selected_ids[k] * (off_t)g_stream_ctx.expert_stride,
+                                    .size = (size_t)g_stream_ctx.expert_stride
+                                };
+                                n_tasks = slot + 1;
+                            }
+                            slot++;
+                        }
+                    }
+                    ds4_io_pool_dispatch(
+                        (ds4_io_pool *)g_stream_ctx.io_pool, tasks, n_tasks);
+                }
+                if (g_expert_cache.lookup) {
+                    for (int k = 0; k < DS4_N_EXPERT_USED; k++) {
+                        if (!cached_mask[k])
+                            ds4_expert_cache_insert(il, (uint32_t)selected_ids[k],
+                                                   ds4_gpu_expert_dma_ptr(k));
+                    }
+                }
             }
             if (ok) {
                 memcpy(g_stream_ctx.prev_selected[il], selected_ids,
@@ -12495,6 +12875,22 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                 n_comp,
                                                                 &index_stage_t0);
             }
+            const bool use_streaming_topk = n_comp > 1024 &&
+                                              !getenv("DS4_FORCE_MATERIALIZE_INDEXER");
+            if (use_streaming_topk) {
+                ok = ds4_gpu_indexer_streaming_topk_tensor(g->comp_selected,
+                                                             g->batch_indexer_q,
+                                                             g->batch_indexer_weights,
+                                                             g->layer_index_comp_cache[il],
+                                                             n_comp,
+                                                             n_tokens,
+                                                             pos0,
+                                                             DS4_N_INDEXER_HEAD,
+                                                             DS4_N_INDEXER_HEAD_DIM,
+                                                             DS4_N_INDEXER_TOP_K,
+                                                             ratio,
+                                                             index_scale) != 0;
+            } else {
             ok = ds4_gpu_indexer_scores_prefill_tensor(g->indexer_scores,
                                                          g->batch_indexer_q,
                                                          g->batch_indexer_weights,
@@ -12542,6 +12938,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                       pos0);
                 }
             }
+            } // end else (materialize path)
             if (ok) {
                 ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(g->batch_heads,
                                                                           model->map,
@@ -13004,19 +13401,77 @@ static bool metal_graph_encode_layer_ffn_batch(
                 for (int k = 0; k < DS4_N_EXPERT_USED; k++)
                     pfill_rp[k] = (int32_t)k;
 
+                bool pf_cache_mask[DS4_N_EXPERT_USED] = {false};
+                int pf_hits_gu = 0;
+                if (g_expert_cache.lookup) {
+                    for (int k = 0; k < DS4_N_EXPERT_USED; k++) {
+                        void *cached = ds4_expert_cache_get(il, (uint32_t)tok_sel[k]);
+                        if (cached) {
+                            const uint8_t *src = (const uint8_t *)cached;
+                            memcpy((uint8_t *)pfill_gp + (uint64_t)k * gate_expert_bytes,
+                                   src, (size_t)gate_expert_bytes);
+                            memcpy((uint8_t *)pfill_up + (uint64_t)k * g_stream_ctx.up_expert_bytes,
+                                   src + g_stream_ctx.gate_bytes,
+                                   (size_t)g_stream_ctx.up_expert_bytes);
+                            pf_cache_mask[k] = true;
+                            pf_hits_gu++;
+                        }
+                    }
+                }
+
                 ok = ds4_gpu_begin_commands() != 0;
 
-                if (ok && ds4_gpu_io_queue_available() &&
+                if (pf_hits_gu == DS4_N_EXPERT_USED) {
+                    /* All from cache */
+                } else if (ok && ds4_gpu_io_queue_available() && pf_hits_gu == 0 &&
                     ds4_gpu_io_load_staged_gate_up(il, tok_sel, DS4_N_EXPERT_USED,
                         g_stream_ctx.gate_expert_bytes, g_stream_ctx.up_expert_bytes,
                         g_stream_ctx.expert_stride, g_stream_ctx.gguf_direct,
                         g_stream_ctx.gate_abs, g_stream_ctx.up_abs)) {
                     /* IO queue path */
-                } else if (ok) {
-                    stream_build_expert_tasks_staged_gate_up(
-                        tasks, &n_tasks, il,
-                        tok_sel, DS4_N_EXPERT_USED,
-                        (uint8_t *)pfill_gp, (uint8_t *)pfill_up);
+                } else if (ok && pf_hits_gu < DS4_N_EXPERT_USED) {
+                    n_tasks = 0;
+                    if (g_expert_cache.lookup) {
+                        for (int k = 0; k < DS4_N_EXPERT_USED; k++) {
+                            if (pf_cache_mask[k]) continue;
+                            if (g_stream_ctx.gguf_direct) {
+                                tasks[n_tasks++] = (ds4_io_task){
+                                    .fd = g_stream_ctx.model_fd,
+                                    .dst = (uint8_t *)pfill_gp + (uint64_t)k * gate_expert_bytes,
+                                    .offset = (off_t)(g_stream_ctx.gate_abs[il] +
+                                        (uint64_t)tok_sel[k] * g_stream_ctx.gate_expert_bytes),
+                                    .size = (size_t)g_stream_ctx.gate_expert_bytes
+                                };
+                                tasks[n_tasks++] = (ds4_io_task){
+                                    .fd = g_stream_ctx.model_fd,
+                                    .dst = (uint8_t *)pfill_up + (uint64_t)k * g_stream_ctx.up_expert_bytes,
+                                    .offset = (off_t)(g_stream_ctx.up_abs[il] +
+                                        (uint64_t)tok_sel[k] * g_stream_ctx.up_expert_bytes),
+                                    .size = (size_t)g_stream_ctx.up_expert_bytes
+                                };
+                            } else {
+                                const off_t base = (off_t)tok_sel[k] *
+                                                   (off_t)g_stream_ctx.expert_stride;
+                                tasks[n_tasks++] = (ds4_io_task){
+                                    .fd = g_stream_ctx.fds[il],
+                                    .dst = (uint8_t *)pfill_gp + (uint64_t)k * g_stream_ctx.gate_bytes,
+                                    .offset = base,
+                                    .size = (size_t)g_stream_ctx.gate_bytes
+                                };
+                                tasks[n_tasks++] = (ds4_io_task){
+                                    .fd = g_stream_ctx.fds[il],
+                                    .dst = (uint8_t *)pfill_up + (uint64_t)k * g_stream_ctx.up_bytes,
+                                    .offset = base + (off_t)g_stream_ctx.gate_bytes,
+                                    .size = (size_t)g_stream_ctx.up_bytes
+                                };
+                            }
+                        }
+                    } else {
+                        stream_build_expert_tasks_staged_gate_up(
+                            tasks, &n_tasks, il,
+                            tok_sel, DS4_N_EXPERT_USED,
+                            (uint8_t *)pfill_gp, (uint8_t *)pfill_up);
+                    }
                     ds4_io_pool_dispatch((ds4_io_pool *)g_stream_ctx.io_pool,
                                          tasks, n_tasks);
                 }
@@ -13031,20 +13486,77 @@ static bool metal_graph_encode_layer_ffn_batch(
                     x_view) != 0;
                 if (ok) ok = ds4_gpu_flush_commands() != 0;
 
-                if (ok && ds4_gpu_io_queue_available() &&
+                int pf_hits_d = 0;
+                if (g_expert_cache.lookup) {
+                    for (int k = 0; k < DS4_N_EXPERT_USED; k++) {
+                        if (pf_cache_mask[k]) {
+                            const uint8_t *src = (const uint8_t *)
+                                g_expert_cache.buffers[
+                                    g_expert_cache.lookup[il * DS4_N_EXPERT + tok_sel[k]]];
+                            memcpy((uint8_t *)pfill_dp + (uint64_t)k * down_expert_bytes,
+                                   src + g_stream_ctx.gate_bytes + g_stream_ctx.up_bytes,
+                                   (size_t)down_expert_bytes);
+                            pf_hits_d++;
+                        }
+                    }
+                }
+
+                if (pf_hits_d == DS4_N_EXPERT_USED) {
+                    /* All from cache */
+                } else if (ok && ds4_gpu_io_queue_available() && pf_hits_d == 0 &&
                     ds4_gpu_io_load_staged_down(il, tok_sel, DS4_N_EXPERT_USED,
                         g_stream_ctx.down_expert_bytes, g_stream_ctx.gate_bytes,
                         g_stream_ctx.up_bytes, g_stream_ctx.expert_stride,
                         g_stream_ctx.gguf_direct, g_stream_ctx.down_abs)) {
                     /* IO queue path */
-                } else if (ok) {
+                } else if (ok && pf_hits_d < DS4_N_EXPERT_USED) {
                     n_tasks = 0;
-                    stream_build_expert_tasks_staged_down(
-                        tasks, &n_tasks, il,
-                        tok_sel, DS4_N_EXPERT_USED,
-                        (uint8_t *)pfill_dp);
+                    if (g_expert_cache.lookup) {
+                        for (int k = 0; k < DS4_N_EXPERT_USED; k++) {
+                            if (pf_cache_mask[k]) continue;
+                            if (g_stream_ctx.gguf_direct) {
+                                tasks[n_tasks++] = (ds4_io_task){
+                                    .fd = g_stream_ctx.model_fd,
+                                    .dst = (uint8_t *)pfill_dp + (uint64_t)k * down_expert_bytes,
+                                    .offset = (off_t)(g_stream_ctx.down_abs[il] +
+                                        (uint64_t)tok_sel[k] * g_stream_ctx.down_expert_bytes),
+                                    .size = (size_t)g_stream_ctx.down_expert_bytes
+                                };
+                            } else {
+                                const off_t base = (off_t)tok_sel[k] *
+                                                   (off_t)g_stream_ctx.expert_stride;
+                                tasks[n_tasks++] = (ds4_io_task){
+                                    .fd = g_stream_ctx.fds[il],
+                                    .dst = (uint8_t *)pfill_dp + (uint64_t)k * g_stream_ctx.down_bytes,
+                                    .offset = base + (off_t)g_stream_ctx.gate_bytes +
+                                              (off_t)g_stream_ctx.up_bytes,
+                                    .size = (size_t)g_stream_ctx.down_bytes
+                                };
+                            }
+                        }
+                    } else {
+                        stream_build_expert_tasks_staged_down(
+                            tasks, &n_tasks, il,
+                            tok_sel, DS4_N_EXPERT_USED,
+                            (uint8_t *)pfill_dp);
+                    }
                     ds4_io_pool_dispatch((ds4_io_pool *)g_stream_ctx.io_pool,
                                          tasks, n_tasks);
+                }
+
+                if (g_expert_cache.lookup) {
+                    for (int k = 0; k < DS4_N_EXPERT_USED; k++) {
+                        if (!pf_cache_mask[k]) {
+                            ds4_expert_cache_insert_parts(
+                                il, (uint32_t)tok_sel[k],
+                                (uint8_t *)pfill_gp + (uint64_t)k * gate_expert_bytes,
+                                (size_t)gate_expert_bytes,
+                                (uint8_t *)pfill_up + (uint64_t)k * g_stream_ctx.up_expert_bytes,
+                                (size_t)g_stream_ctx.up_expert_bytes,
+                                (uint8_t *)pfill_dp + (uint64_t)k * down_expert_bytes,
+                                (size_t)down_expert_bytes);
+                        }
+                    }
                 }
 
                 if (ok) ok = ds4_gpu_routed_moe_one_streamed_down(
@@ -18017,6 +18529,41 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             }
         }
 #endif
+        {
+            uint64_t sys_mem = ds4_system_memory_bytes();
+            uint64_t mapped = e->model.size;
+            if (e->mtp_ready) mapped += e->mtp_model.size;
+            uint64_t stride = g_stream_ctx.active ? g_stream_ctx.expert_stride : 0;
+            g_memory_budget = ds4_compute_memory_budget(sys_mem, mapped, stride, 131072);
+            if (g_memory_budget.expert_cache_slots > 0) {
+                fprintf(stderr,
+                    "ds4: memory budget %.1f/%.1f GiB — model %.1f, kv %.1f, scratch %.1f, "
+                    "expert cache %.1f GiB (%u slots, %.0f%% of %u×%u)\n",
+                    (double)g_memory_budget.budget / (1024.0*1024*1024),
+                    (double)g_memory_budget.total_system / (1024.0*1024*1024),
+                    (double)g_memory_budget.model_mapped / (1024.0*1024*1024),
+                    (double)g_memory_budget.kv_cache / (1024.0*1024*1024),
+                    (double)g_memory_budget.compute_scratch / (1024.0*1024*1024),
+                    (double)g_memory_budget.expert_cache / (1024.0*1024*1024),
+                    g_memory_budget.expert_cache_slots,
+                    100.0 * g_memory_budget.expert_cache_slots /
+                        (double)(DS4_N_LAYER * DS4_N_EXPERT),
+                    (unsigned)DS4_N_LAYER, (unsigned)DS4_N_EXPERT);
+            } else {
+                fprintf(stderr,
+                    "ds4: memory budget %.1f/%.1f GiB — model %.1f, kv %.1f, scratch %.1f "
+                    "(no room for expert cache)\n",
+                    (double)g_memory_budget.budget / (1024.0*1024*1024),
+                    (double)g_memory_budget.total_system / (1024.0*1024*1024),
+                    (double)g_memory_budget.model_mapped / (1024.0*1024*1024),
+                    (double)g_memory_budget.kv_cache / (1024.0*1024*1024),
+                    (double)g_memory_budget.compute_scratch / (1024.0*1024*1024));
+            }
+            if (g_memory_budget.expert_cache_slots > 0 && e->expert_streaming) {
+                ds4_expert_cache_init(g_memory_budget.expert_cache_slots,
+                                     g_stream_ctx.expert_stride);
+            }
+        }
         fprintf(stderr, "ds4: %s backend initialized for graph diagnostics\n",
                 ds4_backend_name(e->backend));
     }
@@ -18040,6 +18587,16 @@ void ds4_engine_summary(ds4_engine *e) {
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
+    if (g_expert_cache.lookup) {
+        if (g_expert_cache.hits + g_expert_cache.misses > 0) {
+            fprintf(stderr, "ds4: expert cache final stats: %llu hits, %llu misses (%.1f%% hit rate)\n",
+                    (unsigned long long)g_expert_cache.hits,
+                    (unsigned long long)g_expert_cache.misses,
+                    100.0 * g_expert_cache.hits /
+                        (double)(g_expert_cache.hits + g_expert_cache.misses));
+        }
+        ds4_expert_cache_free();
+    }
     expert_streaming_close(e);
     weights_free(&e->weights);
     vocab_free(&e->vocab);

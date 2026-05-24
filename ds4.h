@@ -89,6 +89,17 @@ typedef struct {
 } ds4_context_memory;
 
 typedef struct {
+    uint64_t total_system;
+    uint64_t budget;
+    uint64_t model_mapped;
+    uint64_t kv_cache;
+    uint64_t compute_scratch;
+    uint64_t expert_cache;
+    uint32_t expert_cache_slots;
+    uint32_t max_ctx;
+} ds4_memory_budget;
+
+typedef struct {
     uint8_t *ptr;
     uint64_t len;
     uint64_t cap;

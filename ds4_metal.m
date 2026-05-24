@@ -5096,6 +5096,198 @@ int ds4_gpu_indexer_topk_tensor(
     return 1;
 }
 
+int ds4_gpu_indexer_streaming_topk_tensor(
+        ds4_gpu_tensor       *selected,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp,
+        uint32_t                n_comp,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                top_k,
+        uint32_t                ratio,
+        float                   scale) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!selected || !q || !weights || !index_comp ||
+        n_comp == 0 || n_tokens == 0 || n_head == 0 || head_dim == 0 ||
+        top_k == 0 || ratio == 0) {
+        return 0;
+    }
+    if (head_dim != 128) {
+        fprintf(stderr, "ds4: streaming top-k indexer requires head_dim=128\n");
+        return 0;
+    }
+
+    @autoreleasepool {
+        const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
+        const uint64_t w_bytes = (uint64_t)n_tokens * n_head * sizeof(float);
+        const uint64_t comp_bytes = (uint64_t)n_comp * head_dim * sizeof(float);
+        const uint64_t sel_bytes = (uint64_t)top_k * n_tokens * sizeof(uint32_t);
+        id<MTLBuffer> qbuf = ds4_gpu_tensor_buffer(q);
+        id<MTLBuffer> wbuf = ds4_gpu_tensor_buffer(weights);
+        id<MTLBuffer> compbuf = ds4_gpu_tensor_buffer(index_comp);
+        id<MTLBuffer> selbuf = ds4_gpu_tensor_buffer(selected);
+        if (!qbuf || !wbuf || !compbuf || !selbuf ||
+            ds4_gpu_tensor_bytes(q) < q_bytes ||
+            ds4_gpu_tensor_bytes(weights) < w_bytes ||
+            ds4_gpu_tensor_bytes(index_comp) < comp_bytes ||
+            ds4_gpu_tensor_bytes(selected) < sel_bytes) {
+            fprintf(stderr, "ds4: streaming top-k indexer received undersized buffers\n");
+            return 0;
+        }
+
+        // Choose number of splits based on n_comp to maximize GPU occupancy.
+        // Target: at least 160 threadgroups for M4 Pro (20 cores × 8 occupancy).
+        uint32_t n_splits = 1;
+        {
+            const uint64_t min_tgroups = 160;
+            while (n_splits < 16 && (uint64_t)n_tokens * n_splits < min_tgroups) {
+                n_splits *= 2;
+            }
+            if (n_splits == 1 && n_comp > 4096) n_splits = 4;
+            if (n_splits == 1 && n_comp > 2048) n_splits = 2;
+            if (n_splits > 1 && n_comp / n_splits < 64) n_splits = 1;
+        }
+
+        // Allocate scratch for partial results: n_tokens × n_splits × top_k × (float + int32)
+        const uint64_t partial_elems = (uint64_t)n_tokens * n_splits * top_k;
+        const uint64_t partial_scores_bytes = partial_elems * sizeof(float);
+        const uint64_t partial_indices_bytes = partial_elems * sizeof(int32_t);
+
+        id<MTLBuffer> partial_scores_buf = [g_device newBufferWithLength:partial_scores_bytes + partial_indices_bytes
+                                                                 options:MTLResourceStorageModeShared];
+        if (!partial_scores_buf) {
+            fprintf(stderr, "ds4: streaming top-k failed to allocate partial buffers\n");
+            return 0;
+        }
+        NSUInteger partial_indices_offset = partial_scores_bytes;
+
+        // ===== Stage 1: Split kernel =====
+        id<MTLComputePipelineState> split_pipeline = ds4_gpu_get_pipeline(
+            "kernel_dsv4_indexer_streaming_topk_split");
+        if (!split_pipeline) {
+            fprintf(stderr, "ds4: failed to get streaming topk split pipeline\n");
+            return 0;
+        }
+
+        typedef struct {
+            uint32_t n_comp;
+            uint32_t n_tokens;
+            uint32_t n_splits;
+            uint32_t top_k;
+            uint32_t n_head;
+            uint32_t head_dim;
+            uint32_t pos0;
+            uint32_t ratio;
+            uint64_t q_token_stride;
+            uint64_t q_head_stride;
+            uint64_t weights_token_stride;
+            uint64_t index_row_stride;
+            float    scale;
+        } streaming_topk_args;
+
+        streaming_topk_args split_args = {
+            .n_comp = n_comp,
+            .n_tokens = n_tokens,
+            .n_splits = n_splits,
+            .top_k = top_k,
+            .n_head = n_head,
+            .head_dim = head_dim,
+            .pos0 = pos0,
+            .ratio = ratio,
+            .q_token_stride = (uint64_t)n_head * head_dim * sizeof(float),
+            .q_head_stride = (uint64_t)head_dim * sizeof(float),
+            .weights_token_stride = (uint64_t)n_head * sizeof(float),
+            .index_row_stride = (uint64_t)head_dim * sizeof(float),
+            .scale = scale,
+        };
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        {
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:split_pipeline];
+            [enc setBytes:&split_args length:sizeof(split_args) atIndex:0];
+            [enc setBuffer:qbuf offset:ds4_gpu_tensor_offset(q) atIndex:1];
+            [enc setBuffer:wbuf offset:ds4_gpu_tensor_offset(weights) atIndex:2];
+            [enc setBuffer:compbuf offset:ds4_gpu_tensor_offset(index_comp) atIndex:3];
+            [enc setBuffer:partial_scores_buf offset:0 atIndex:4];
+            [enc setBuffer:partial_scores_buf offset:partial_indices_offset atIndex:5];
+
+            // Shared memory: ktg + qtg + dot + heap_v + heap_i
+            // = 8192 + 2048 + 1152 + top_k*4 + top_k*4
+            const NSUInteger shared_bytes = 32u * 128u * sizeof(uint16_t) +   // ktg
+                                            8u * 128u * sizeof(uint16_t) +    // qtg
+                                            288u * sizeof(float) +            // dot (scores + sg store)
+                                            (NSUInteger)top_k * sizeof(float) + // heap_v
+                                            (NSUInteger)top_k * sizeof(int32_t); // heap_i
+            [enc setThreadgroupMemoryLength:shared_bytes atIndex:0];
+
+            const NSUInteger grid_size = (NSUInteger)n_tokens * n_splits;
+            [enc dispatchThreadgroups:MTLSizeMake(grid_size, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+        }
+
+        // ===== Stage 2: Merge kernel =====
+        if (n_splits > 1) {
+            id<MTLComputePipelineState> merge_pipeline = ds4_gpu_get_pipeline(
+                "kernel_dsv4_indexer_streaming_topk_merge");
+            if (!merge_pipeline) {
+                fprintf(stderr, "ds4: failed to get streaming topk merge pipeline\n");
+                return 0;
+            }
+
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:merge_pipeline];
+            [enc setBytes:&split_args length:sizeof(split_args) atIndex:0];
+            [enc setBuffer:partial_scores_buf offset:0 atIndex:1];
+            [enc setBuffer:partial_scores_buf offset:partial_indices_offset atIndex:2];
+            [enc setBuffer:selbuf offset:ds4_gpu_tensor_offset(selected) atIndex:3];
+
+            // Merge shared memory: total_candidates × (float + int32)
+            const NSUInteger merge_shared = (NSUInteger)n_splits * top_k * (sizeof(float) + sizeof(int32_t));
+            [enc setThreadgroupMemoryLength:merge_shared atIndex:0];
+
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+        } else {
+            // Single split: copy results directly and sort by index
+            // The split kernel already wrote top_k entries but they need
+            // to be sorted ascending by index and written in the correct stride.
+            id<MTLComputePipelineState> merge_pipeline = ds4_gpu_get_pipeline(
+                "kernel_dsv4_indexer_streaming_topk_merge");
+            if (!merge_pipeline) {
+                fprintf(stderr, "ds4: failed to get streaming topk merge pipeline\n");
+                return 0;
+            }
+
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:merge_pipeline];
+            [enc setBytes:&split_args length:sizeof(split_args) atIndex:0];
+            [enc setBuffer:partial_scores_buf offset:0 atIndex:1];
+            [enc setBuffer:partial_scores_buf offset:partial_indices_offset atIndex:2];
+            [enc setBuffer:selbuf offset:ds4_gpu_tensor_offset(selected) atIndex:3];
+
+            const NSUInteger merge_shared = (NSUInteger)n_splits * top_k * (sizeof(float) + sizeof(int32_t));
+            [enc setThreadgroupMemoryLength:merge_shared atIndex:0];
+
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+        }
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "streaming top-k indexer")) return 0;
+    }
+
+    return 1;
+}
+
 int ds4_gpu_dsv4_topk_mask_tensor(
         ds4_gpu_tensor       *mask,
         const ds4_gpu_tensor *topk,

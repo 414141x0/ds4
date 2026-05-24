@@ -1086,3 +1086,344 @@ kernel void kernel_dsv4_softmax_pool(
 
     *((device float *) (dst + id*args.nb0 + ic*args.nb1)) = acc/sum;
 }
+
+// ============================================================================
+// Streaming Top-K Indexer (StreamIndex-inspired)
+//
+// Replaces the materialize-all score matrix + bitonic argsort path for prefill.
+// One threadgroup per (token, split) pair. Each threadgroup streams through its
+// partition of compressed rows in blocks of 32, computing scores via
+// simdgroup_float8x8 matmul and maintaining a running top-k set in threadgroup
+// memory. After all blocks are processed, the partial top-k is written out.
+// A separate merge kernel combines splits into the final top-k.
+//
+// Optimizations applied:
+//   - simdgroup_float8x8 for Q×K^T (matches existing indexer pattern)
+//   - Half-precision K staging with float accumulation
+//   - Fast block skip when max(block_scores) <= current top-k minimum
+//   - Early causal exit when compressed rows exceed visible range
+//   - Morton-order dispatch for L2 cache locality (in host code)
+// ============================================================================
+
+struct ds4_metal_args_streaming_topk {
+    uint32_t n_comp;
+    uint32_t n_tokens;
+    uint32_t n_splits;
+    uint32_t top_k;
+    uint32_t n_head;
+    uint32_t head_dim;
+    uint32_t pos0;
+    uint32_t ratio;
+    uint64_t q_token_stride;
+    uint64_t q_head_stride;
+    uint64_t weights_token_stride;
+    uint64_t index_row_stride;
+    float    scale;
+};
+
+kernel void kernel_dsv4_indexer_streaming_topk_split(
+        constant ds4_metal_args_streaming_topk & args,
+        device const char *q,
+        device const char *weights,
+        device const char *index_comp,
+        device       float *partial_scores,
+        device       int32_t *partial_indices,
+        threadgroup  char *shared [[threadgroup(0)]],
+        uint  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+
+    constexpr uint BLOCK_K = 32;
+    constexpr uint D = 128;
+    constexpr uint TS = 8;
+    constexpr uint N_SG = 4;
+    constexpr uint NTH = 128;
+
+    const uint token = tgpig / args.n_splits;
+    const uint split = tgpig % args.n_splits;
+    if (token >= args.n_tokens) return;
+
+    const uint comp_per_split = (args.n_comp + args.n_splits - 1u) / args.n_splits;
+    const uint c_begin = split * comp_per_split;
+    const uint c_end = min(c_begin + comp_per_split, args.n_comp);
+    const uint visible = min((args.pos0 + token + 1u) / args.ratio, args.n_comp);
+    const uint effective_end = min(c_end, visible);
+
+    if (c_begin >= effective_end) {
+        const uint64_t out_base = (uint64_t)token * args.n_splits * args.top_k +
+                                  (uint64_t)split * args.top_k;
+        for (uint i = tid; i < args.top_k; i += NTH) {
+            partial_scores[out_base + i] = -INFINITY;
+            partial_indices[out_base + i] = -1;
+        }
+        return;
+    }
+
+    // Shared memory layout:
+    //   ktg:      BLOCK_K × D half          = 32 × 128 × 2 = 8192 B
+    //   qtg:      TS × D half (Q tile)      = 8 × 128 × 2  = 2048 B
+    //   dot:      (BLOCK_K + BLOCK_K*TS) float = 288 × 4   = 1152 B
+    //             [0:32] = accumulated scores, [32:288] = simdgroup_store target
+    //   heap_v:   top_k float               = 512 × 4       = 2048 B
+    //   heap_i:   top_k int32               = 512 × 4       = 2048 B
+    //   Total: 15,492 B (fits in 32KB)
+    constexpr uint DOT_SIZE = BLOCK_K + BLOCK_K * TS; // 32 + 256 = 288
+    threadgroup half  *ktg    = (threadgroup half *)shared;
+    threadgroup half  *qtg    = ktg + BLOCK_K * D;
+    threadgroup float *dot    = (threadgroup float *)(qtg + TS * D);
+    threadgroup float *heap_v = dot + DOT_SIZE;
+    threadgroup int32_t *heap_i = (threadgroup int32_t *)(heap_v + args.top_k);
+
+    // Initialize top-k buffer
+    for (uint i = tid; i < args.top_k; i += NTH) {
+        heap_v[i] = -INFINITY;
+        heap_i[i] = -1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint heap_count = 0;
+    float heap_min = -INFINITY;
+    uint heap_min_idx = 0;
+
+    // Main streaming loop over K blocks
+    for (uint c0 = c_begin; c0 < effective_end; c0 += BLOCK_K) {
+        const uint block_end = min(c0 + BLOCK_K, effective_end);
+        const uint block_len = block_end - c0;
+
+        // Stage K block [block_len, D] into threadgroup as half
+        for (uint i = tid; i < BLOCK_K * D; i += NTH) {
+            const uint row = i / D;
+            const uint dim = i % D;
+            half v = half(0.0f);
+            if (row < block_len) {
+                device const float *krow = (device const float *)
+                    (index_comp + (uint64_t)(c0 + row) * args.index_row_stride);
+                v = half(krow[dim]);
+            }
+            ktg[i] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Score computation across all heads using simdgroup_float8x8.
+        // Layout: 4 simdgroups, each handles 8 K rows (4×8=32 covers BLOCK_K).
+        // Each head iteration: stage Q[token,head,0:D] (8-wide tile for matmul),
+        // multiply against K[sg*8 : (sg+1)*8], accumulate ReLU*weight into dot.
+
+        // Zero the dot accumulator: dot[8][32] reused across heads
+        // We only need dot[sg_row_in_8x8 result] per simdgroup.
+        // After all heads: dot[0:block_len] holds final scores.
+        //
+        // Simpler approach matching existing kernel: each iteration of the head
+        // loop accumulates into thread-local values via the 8×8 matmul pattern.
+        // The dot[] array in shared holds intermediate per-head-iteration results
+        // that each thread reads its assigned cells from.
+
+        // Zero scores for this block (only thread 0 needs final scores,
+        // but we use shared for the simdgroup_store target)
+        for (uint i = tid; i < BLOCK_K; i += NTH) {
+            dot[i] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint head = 0; head < args.n_head; head++) {
+            // Stage Q[token, head, 0:D] into qtg as half.
+            // We replicate the single Q row 8 times so simdgroup_load
+            // produces valid 8×8 tiles (all rows identical).
+            for (uint i = tid; i < TS * D; i += NTH) {
+                const uint dim = i % D;
+                device const float *qrow = (device const float *)
+                    (q + (uint64_t)token * args.q_token_stride +
+                         (uint64_t)head * args.q_head_stride);
+                qtg[i] = half(qrow[dim]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // simdgroup matmul: Q[8,D] × K[8,D]^T → result[8,8]
+            // Each simdgroup sg covers K rows [sg*8, (sg+1)*8).
+            // Uses the same store pattern as kernel_dsv4_indexer_scores_tiled:
+            // store with stride=BLOCK_K so row 0 lands at dot[sg*TS + col].
+            simdgroup_float8x8 mdot = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            for (uint db = 0; db < D / TS; db++) {
+                simdgroup_half8x8 mq, mk;
+                simdgroup_load(mq, qtg + db * TS, D, 0, false);
+                simdgroup_load(mk, ktg + (uint)sg * TS * D + db * TS, D, 0, true);
+                simdgroup_multiply_accumulate(mdot, mq, mk, mdot);
+            }
+
+            // Store 8×8 result: stride=BLOCK_K puts column c at dot[row*32 + sg*8+c].
+            // Row 0 at dot[sg*8 + c] holds Q·K[sg*8+c] (all rows identical).
+            simdgroup_store(mdot, dot + BLOCK_K + (uint)sg * TS, BLOCK_K, 0, false);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Accumulate ReLU(dot) × weight into running score at dot[0:block_len]
+            device const float *w = (device const float *)
+                (weights + (uint64_t)token * args.weights_token_stride);
+            const float wh = w[head] * args.scale;
+
+            for (uint i = tid; i < block_len; i += NTH) {
+                // Read from row 0 of the stored 8×8 result
+                const float s = dot[BLOCK_K + i];
+                dot[i] += max(s, 0.0f) * wh;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        // === Fast block skip: check if any score can enter the heap ===
+        float local_max = -INFINITY;
+        for (uint i = tid; i < block_len; i += NTH) {
+            local_max = max(local_max, dot[i]);
+        }
+        local_max = simd_max(local_max);
+        // Cross-simdgroup reduction (use last 4 floats of dot area)
+        if (lane == 0) dot[DOT_SIZE - N_SG + sg] = local_max;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float block_max = max(max(dot[DOT_SIZE - 4], dot[DOT_SIZE - 3]),
+                                    max(dot[DOT_SIZE - 2], dot[DOT_SIZE - 1]));
+
+        if (block_max <= heap_min && heap_count >= args.top_k) {
+            continue;
+        }
+
+        // === Insert qualifying scores into heap (thread 0 serial) ===
+        if (tid == 0) {
+            for (uint i = 0; i < block_len; i++) {
+                const float s = dot[i];
+                if (heap_count < args.top_k) {
+                    heap_v[heap_count] = s;
+                    heap_i[heap_count] = (int32_t)(c0 + i);
+                    heap_count++;
+                    if (heap_count == args.top_k) {
+                        // Find initial minimum
+                        heap_min = heap_v[0];
+                        heap_min_idx = 0;
+                        for (uint j = 1; j < args.top_k; j++) {
+                            if (heap_v[j] < heap_min) {
+                                heap_min = heap_v[j];
+                                heap_min_idx = j;
+                            }
+                        }
+                    }
+                } else if (s > heap_min) {
+                    heap_v[heap_min_idx] = s;
+                    heap_i[heap_min_idx] = (int32_t)(c0 + i);
+                    // Rescan for new minimum
+                    heap_min = heap_v[0];
+                    heap_min_idx = 0;
+                    for (uint j = 1; j < args.top_k; j++) {
+                        if (heap_v[j] < heap_min) {
+                            heap_min = heap_v[j];
+                            heap_min_idx = j;
+                        }
+                    }
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Broadcast updated min to all threads
+        if (tid == 0) {
+            dot[0] = heap_min;
+            // Store heap_count in a known location for the skip check
+            dot[1] = as_type<float>((uint32_t)heap_count);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        heap_min = dot[0];
+        heap_count = as_type<uint32_t>(dot[1]);
+    }
+
+    // === Output partial top-k for this (token, split) ===
+    const uint64_t out_base = (uint64_t)token * args.n_splits * args.top_k +
+                              (uint64_t)split * args.top_k;
+    for (uint i = tid; i < args.top_k; i += NTH) {
+        partial_scores[out_base + i] = heap_v[i];
+        partial_indices[out_base + i] = heap_i[i];
+    }
+}
+
+// Merge kernel: combines n_splits partial top-k results into the final top-k
+// for each token. Uses bitonic sort on the combined candidates, then outputs
+// the top_k entries sorted ascending by index (for cache-friendly attention).
+kernel void kernel_dsv4_indexer_streaming_topk_merge(
+        constant ds4_metal_args_streaming_topk & args,
+        device const float   *partial_scores,
+        device const int32_t *partial_indices,
+        device       int32_t *selected,
+        threadgroup  char    *shared [[threadgroup(0)]],
+        uint  token [[threadgroup_position_in_grid]],
+        ushort tid  [[thread_index_in_threadgroup]]) {
+    if (token >= args.n_tokens) return;
+
+    // Load all candidates: n_splits × top_k entries per token
+    const uint total_candidates = args.n_splits * args.top_k;
+    const uint64_t base = (uint64_t)token * total_candidates;
+
+    threadgroup float   *sv = (threadgroup float *)shared;
+    threadgroup int32_t *si = (threadgroup int32_t *)(sv + total_candidates);
+
+    // Cooperative load
+    for (uint i = tid; i < total_candidates; i += 512u) {
+        sv[i] = partial_scores[base + i];
+        si[i] = partial_indices[base + i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // === Parallel selection: find top_k by score (descending) ===
+    // Strategy: each thread finds the score at rank top_k (the threshold),
+    // then all threads cooperatively mark entries above threshold.
+    //
+    // Simple approach: iterative min-replacement (thread 0, top_k iterations).
+    // For top_k=512 and total_candidates=4096, this is 512 passes over 4096
+    // elements. At ~4096 comparisons per pass × 512 passes = 2M ops on thread 0.
+    // Takes ~20µs on M4 Pro. Acceptable for a one-per-token kernel.
+    //
+    // Better approach: partial bitonic sort. Sort all total_candidates by score
+    // descending, then take first top_k, then sort those ascending by index.
+
+    // Bitonic sort by score (descending). total_candidates must be power of 2
+    // or we pad. For n_splits=8, top_k=512: total=4096 (already power of 2).
+    const uint n = total_candidates;
+    for (uint k = 2; k <= n; k <<= 1) {
+        for (uint j = k >> 1; j > 0; j >>= 1) {
+            for (uint i = tid; i < n; i += 512u) {
+                const uint other = i ^ j;
+                if (other > i && other < n) {
+                    const bool ascending = (i & k) != 0;
+                    const float a = sv[i], b = sv[other];
+                    // Descending: swap if a < b when we want descending in this half
+                    if ((!ascending && a < b) || (ascending && a > b)) {
+                        sv[i] = b; sv[other] = a;
+                        const int32_t ai = si[i], bi = si[other];
+                        si[i] = bi; si[other] = ai;
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    // Now sv[0..top_k-1] are the top_k entries (descending by score).
+    // Sort these top_k entries ascending by index for cache-friendly attention.
+    for (uint k = 2; k <= args.top_k; k <<= 1) {
+        for (uint j = k >> 1; j > 0; j >>= 1) {
+            for (uint i = tid; i < args.top_k; i += 512u) {
+                const uint other = i ^ j;
+                if (other > i && other < args.top_k) {
+                    const bool ascending = (i & k) == 0;
+                    const int32_t a = si[i], b = si[other];
+                    if ((ascending && a > b) || (!ascending && a < b)) {
+                        si[i] = b; si[other] = a;
+                        const float av = sv[i], bv = sv[other];
+                        sv[i] = bv; sv[other] = av;
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    // Write final selected indices: selected[k * n_tokens + token] layout
+    // (matches existing comp_selected stride pattern)
+    for (uint i = tid; i < args.top_k; i += 512u) {
+        selected[i * args.n_tokens + token] = si[i];
+    }
+}
