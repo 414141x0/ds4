@@ -13,5 +13,6 @@
 /misc/
 /packed_experts/
 /STREAMING_LOG.md
+/OPTIMIZATION_LOG.md
 .*.swp
 .DS_Store
