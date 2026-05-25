@@ -833,3 +833,34 @@ first answer:
   logit/model issues.
 - `ds4-server --trace` writes the rendered prompts, cache decisions, generated
   text, and tool-parser events for a whole agent session.
+
+## DS4-Lite
+
+Optimizations for running DeepSeek V4 Flash with `--expert-stream` on machines
+where the model exceeds physical RAM (e.g. M4 Pro 48 GB).
+
+**Phase 1 — Streaming Top-K Indexer:** Metal kernels (`dsv4_misc.metal`) for
+streaming compressed-attention index scoring when `n_comp > 1024`, avoiding
+large scratch allocations.
+
+**Phase 2 — Memory Budget Manager:** `ds4_memory_budget` struct computed at
+startup. Reports available headroom for expert caching and correctly avoids
+allocation when the model is memory-pressure-bound.
+
+**Phase 3 — Expert LRU Cache:** O(1) lookup table `[layer * 256 + expert_id]`
+with LRU eviction. Integrated into decode (staged and non-staged) and prefill
+paths. Self-disables on systems where allocation would cause page-cache
+thrashing.
+
+**Phase 4 — Expert-Major Batch Prefill:** Instead of loading 6 experts per
+token (n_tokens x 6 = 12,288 loads), identifies unique experts across all
+tokens (~150), loads each once into Metal staging buffers, then dispatches a
+single expert-major batch GEMM (`kernel_mul_mm_id`). Result: **up to 11x
+prefill speedup** at full 2048-token chunks. Threshold is 2 tokens, so MTP
+verification also benefits from expert deduplication.
+
+**MTP Fix:** Gated the expert-streaming path on `model->map ==
+g_stream_ctx.model_map` so the MTP draft model uses its own mmap'd experts
+instead of incorrectly loading main-model layer data. Enables speculative
+decoding in expert-stream mode: **+33% generation throughput** with
+`--mtp --mtp-draft 2 --mtp-margin 0`.

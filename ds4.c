@@ -129,6 +129,7 @@ typedef struct {
     uint32_t gate_type;
     uint32_t down_type;
     void *io_pool;
+    const void *model_map;         /* main model mmap base — gate streaming path */
     int32_t prev_selected[43][6];  /* previous token's experts per layer */
     bool prev_valid;               /* true after first token completes */
 } ds4_expert_stream_ctx;
@@ -185,6 +186,8 @@ static ds4_memory_budget ds4_compute_memory_budget(uint64_t total_system,
     }
 
     b.compute_scratch = 256ull * 1024 * 1024;
+    if (expert_stride > 0)
+        b.compute_scratch += 256ull * expert_stride;
 
     uint64_t used = b.model_mapped + b.kv_cache + b.compute_scratch;
     if (used >= b.budget) {
@@ -192,6 +195,8 @@ static ds4_memory_budget ds4_compute_memory_budget(uint64_t total_system,
         b.expert_cache_slots = 0;
     } else {
         b.expert_cache = b.budget - used;
+        uint64_t cache_cap = total_system / 8;
+        if (b.expert_cache > cache_cap) b.expert_cache = cache_cap;
         if (expert_stride > 0)
             b.expert_cache_slots = (uint32_t)(b.expert_cache / expert_stride);
         else
@@ -9589,7 +9594,8 @@ static bool metal_graph_encode_decode_layer(
      * kernel enough lead time to pull pages from SSD into the page cache.
      * Stride at 512KB because kern.speculative_prefetch_max_iosize caps each
      * F_RDADVISE call to 512KB — without striding, only ~20% gets prefetched. */
-    if (g_stream_ctx.active && g_stream_ctx.prev_valid) {
+    if (g_stream_ctx.active && g_stream_ctx.prev_valid &&
+        model->map == g_stream_ctx.model_map) {
         static const int ADVISE_CHUNK = 512 * 1024;
         for (int pk = 0; pk < DS4_N_EXPERT_USED; pk++) {
             int32_t pe = g_stream_ctx.prev_selected[il][pk];
@@ -10232,7 +10238,7 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_i32_tensor("ffn_moe_topk", g->router_selected, DS4_N_EXPERT_USED, il, pos);
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, DS4_N_EXPERT_USED, il, pos);
     }
-    if (ok && g_stream_ctx.active) {
+    if (ok && g_stream_ctx.active && model->map == g_stream_ctx.model_map) {
         ok = ds4_gpu_end_commands() != 0;
         bool staged = false;
         bool overlapped = false;
@@ -13382,6 +13388,139 @@ static bool metal_graph_encode_layer_ffn_batch(
                 gate_expert_bytes, down_expert_bytes,
                 &pfill_gp, &pfill_up, &pfill_dp, &pfill_rp);
 
+        const bool use_batch_prefill = ok && n_tokens >= 2 &&
+            ds4_gpu_batch_stage_gate_ptr() != NULL &&
+            !getenv("DS4_FORCE_PERTOK_PREFILL");
+
+        if (use_batch_prefill) {
+            bool expert_needed[DS4_N_EXPERT] = {false};
+            uint32_t unique_experts[DS4_N_EXPERT];
+            uint32_t n_unique = 0;
+            for (uint32_t t = 0; t < n_tokens; t++) {
+                for (int k = 0; k < DS4_N_EXPERT_USED; k++) {
+                    uint32_t eid = (uint32_t)pfill_selected[t * DS4_N_EXPERT_USED + k];
+                    if (!expert_needed[eid]) {
+                        expert_needed[eid] = true;
+                        unique_experts[n_unique++] = eid;
+                    }
+                }
+            }
+
+            uint8_t *gate_stage = (uint8_t *)ds4_gpu_batch_stage_gate_ptr();
+            uint8_t *up_stage = (uint8_t *)ds4_gpu_batch_stage_up_ptr();
+            uint8_t *down_stage = (uint8_t *)ds4_gpu_batch_stage_down_ptr();
+
+            ds4_io_task tasks[DS4_IO_MAX_TASKS];
+            int n_io_tasks = 0;
+            for (uint32_t i = 0; i < n_unique; i++) {
+                uint32_t eid = unique_experts[i];
+                void *cached = ds4_expert_cache_get(il, eid);
+                if (cached) {
+                    const uint8_t *src = (const uint8_t *)cached;
+                    memcpy(gate_stage + (uint64_t)eid * gate_expert_bytes,
+                           src, (size_t)gate_expert_bytes);
+                    memcpy(up_stage + (uint64_t)eid * g_stream_ctx.up_expert_bytes,
+                           src + g_stream_ctx.gate_bytes,
+                           (size_t)g_stream_ctx.up_expert_bytes);
+                    memcpy(down_stage + (uint64_t)eid * down_expert_bytes,
+                           src + g_stream_ctx.gate_bytes + g_stream_ctx.up_bytes,
+                           (size_t)down_expert_bytes);
+                } else {
+                    if (g_stream_ctx.gguf_direct) {
+                        tasks[n_io_tasks++] = (ds4_io_task){
+                            .fd = g_stream_ctx.model_fd,
+                            .dst = gate_stage + (uint64_t)eid * gate_expert_bytes,
+                            .offset = (off_t)(g_stream_ctx.gate_abs[il] +
+                                (uint64_t)eid * g_stream_ctx.gate_expert_bytes),
+                            .size = (size_t)g_stream_ctx.gate_expert_bytes
+                        };
+                        tasks[n_io_tasks++] = (ds4_io_task){
+                            .fd = g_stream_ctx.model_fd,
+                            .dst = up_stage + (uint64_t)eid * g_stream_ctx.up_expert_bytes,
+                            .offset = (off_t)(g_stream_ctx.up_abs[il] +
+                                (uint64_t)eid * g_stream_ctx.up_expert_bytes),
+                            .size = (size_t)g_stream_ctx.up_expert_bytes
+                        };
+                        tasks[n_io_tasks++] = (ds4_io_task){
+                            .fd = g_stream_ctx.model_fd,
+                            .dst = down_stage + (uint64_t)eid * down_expert_bytes,
+                            .offset = (off_t)(g_stream_ctx.down_abs[il] +
+                                (uint64_t)eid * g_stream_ctx.down_expert_bytes),
+                            .size = (size_t)g_stream_ctx.down_expert_bytes
+                        };
+                    } else {
+                        const off_t base = (off_t)eid * (off_t)g_stream_ctx.expert_stride;
+                        tasks[n_io_tasks++] = (ds4_io_task){
+                            .fd = g_stream_ctx.fds[il],
+                            .dst = gate_stage + (uint64_t)eid * g_stream_ctx.gate_bytes,
+                            .offset = base,
+                            .size = (size_t)g_stream_ctx.gate_bytes
+                        };
+                        tasks[n_io_tasks++] = (ds4_io_task){
+                            .fd = g_stream_ctx.fds[il],
+                            .dst = up_stage + (uint64_t)eid * g_stream_ctx.up_bytes,
+                            .offset = base + (off_t)g_stream_ctx.gate_bytes,
+                            .size = (size_t)g_stream_ctx.up_bytes
+                        };
+                        tasks[n_io_tasks++] = (ds4_io_task){
+                            .fd = g_stream_ctx.fds[il],
+                            .dst = down_stage + (uint64_t)eid * g_stream_ctx.down_bytes,
+                            .offset = base + (off_t)g_stream_ctx.gate_bytes +
+                                      (off_t)g_stream_ctx.up_bytes,
+                            .size = (size_t)g_stream_ctx.down_bytes
+                        };
+                    }
+                    if (n_io_tasks >= DS4_IO_MAX_TASKS - 3) {
+                        ds4_io_pool_dispatch(
+                            (ds4_io_pool *)g_stream_ctx.io_pool, tasks, n_io_tasks);
+                        n_io_tasks = 0;
+                    }
+                }
+            }
+            if (n_io_tasks > 0) {
+                ds4_io_pool_dispatch(
+                    (ds4_io_pool *)g_stream_ctx.io_pool, tasks, n_io_tasks);
+            }
+
+            for (uint32_t i = 0; i < n_unique; i++) {
+                uint32_t eid = unique_experts[i];
+                if (ds4_expert_cache_lookup(il, eid) < 0) {
+                    ds4_expert_cache_insert_parts(il, eid,
+                        gate_stage + (uint64_t)eid * gate_expert_bytes,
+                        (size_t)gate_expert_bytes,
+                        up_stage + (uint64_t)eid * g_stream_ctx.up_expert_bytes,
+                        (size_t)g_stream_ctx.up_expert_bytes,
+                        down_stage + (uint64_t)eid * down_expert_bytes,
+                        (size_t)down_expert_bytes);
+                }
+            }
+
+            ok = ds4_gpu_begin_commands() != 0;
+            if (ok) ok = ds4_gpu_routed_moe_batch_staged_tensor(
+                g->batch_routed_out,
+                g->batch_routed_gate,
+                g->batch_routed_up,
+                g->batch_routed_mid,
+                g->batch_routed_down,
+                layer->ffn_gate_exps->type,
+                layer->ffn_down_exps->type,
+                gate_expert_bytes,
+                gate_row_bytes,
+                down_expert_bytes,
+                down_row_bytes,
+                (uint32_t)expert_in_dim,
+                (uint32_t)down_in_dim,
+                (uint32_t)routed_out_dim,
+                g->batch_router_selected,
+                g->batch_router_weights,
+                DS4_N_EXPERT_USED,
+                DS4_SWIGLU_CLAMP_EXP,
+                g->batch_ffn_norm,
+                n_tokens,
+                &g->batch_routed_mid_is_f16) != 0;
+
+            if (ok) ok = ds4_gpu_end_commands() != 0;
+        } else
         for (uint32_t t = 0; t < n_tokens && ok; t++) {
             const int32_t *tok_sel = pfill_selected + (size_t)t * DS4_N_EXPERT_USED;
 
@@ -18304,6 +18443,7 @@ static bool expert_streaming_init(ds4_engine *e, const char *dir) {
     }
 
     g_stream_ctx.gguf_direct = false;
+    g_stream_ctx.model_map = e->model.map;
     g_stream_ctx.active = true;
     e->expert_streaming = true;
     fprintf(stderr, "ds4: expert streaming enabled from %s%s\n", dir,
@@ -18345,6 +18485,7 @@ static bool expert_streaming_init_gguf(ds4_engine *e) {
     fcntl(g_stream_ctx.model_fd, F_RDAHEAD, 1);
 
     g_stream_ctx.gguf_direct = true;
+    g_stream_ctx.model_map = e->model.map;
     g_stream_ctx.active = true;
     e->expert_streaming = true;
     fprintf(stderr, "ds4: expert streaming enabled (GGUF-direct, zero extra disk)\n");
@@ -18562,6 +18703,11 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             if (g_memory_budget.expert_cache_slots > 0 && e->expert_streaming) {
                 ds4_expert_cache_init(g_memory_budget.expert_cache_slots,
                                      g_stream_ctx.expert_stride);
+            }
+            if (e->expert_streaming) {
+                ds4_gpu_init_batch_staging(g_stream_ctx.gate_expert_bytes,
+                                          g_stream_ctx.up_expert_bytes,
+                                          g_stream_ctx.down_expert_bytes);
             }
         }
         fprintf(stderr, "ds4: %s backend initialized for graph diagnostics\n",
